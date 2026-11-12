@@ -266,6 +266,11 @@ def register_model_moe_layers(model, runtime) -> int:
             norm_topk_prob=True,
             n_group=1,
             topk_group=1,
+            expert_id_offset=(
+                0
+                if daemon_loads
+                else int(getattr(experts, "moe_ep_rank", 0)) * num_experts
+            ),
         )
 
         if daemon_loads:

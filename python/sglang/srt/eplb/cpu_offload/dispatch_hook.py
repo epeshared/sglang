@@ -95,134 +95,52 @@ def begin_cpu_offload(
             )
 
             gctx = get_cuda_graph_offload_ctx()
-            if gctx is not None and gctx.initialized and gctx.has_layer(layer_id):
-                from sglang.srt.eplb.cpu_offload import get_cpu_offload_runtime
+            from sglang.srt.eplb.cpu_offload import get_cpu_offload_runtime
 
-                rt = get_cpu_offload_runtime()
-                if rt is None and _MOE_TRACE:
-                    _trace.reason(
-                        "hook.begin.capture_skip", "cpu offload runtime is None"
-                    )
-                if rt is not None:
-                    cpu_slot = rt.local_cpu_slot(layer_id)
-                    _diag_k = "_graph_capture_diag"
-                    _diag_cnt = getattr(begin_cpu_offload, _diag_k, 0)
-                    if _diag_cnt < 5:
-                        # WARNING: do NOT call .tolist() or .item() here —
-                        # D2H sync is prohibited during graph capture.
-                        print(
-                            f"[cuda_graph_offload][capture] layer={layer_id} "
-                            f"cpu_slot={cpu_slot} n_tokens={topk_ids.shape[0]} "
-                            f"topk_ids_shape={topk_ids.shape}",
-                            flush=True,
-                        )
-                        setattr(begin_cpu_offload, _diag_k, _diag_cnt + 1)
-                    if cpu_slot >= 0:
-                        stream = torch.cuda.current_stream().cuda_stream
-                        # Static [local_lo, local_hi] block of THIS rank's own
-                        # GPU-resident experts (same block-layout formula as
-                        # _build_local_expert_set_fn in runtime.py), used only
-                        # for the METRICS pair-counting kernel below -- it must
-                        # NOT be derived from cpu_slot (a dynamically rotating
-                        # expert id picked precisely because it lies OUTSIDE
-                        # this rank's GPU block; an earlier formula here,
-                        # `n_local = (cpu_slot+1)//(local_rank+1)`, was bogus
-                        # and produced meaningless/rank-dependent total/to_gpu
-                        # figures in the printed METRICS).
-                        _local_lo, _local_hi = -1, -1
-                        try:
-                            from sglang.srt.eplb.expert_location import (
-                                get_global_expert_location_metadata,
-                            )
-
-                            _meta = get_global_expert_location_metadata()
-                            if _meta is not None:
-                                _n_local = int(_meta.num_local_physical_experts)
-                                _local_lo = rt.local_rank * _n_local
-                                _local_hi = _local_lo + _n_local - 1
-                        except Exception:
-                            pass
-                        ctx = gctx.begin_offload(
-                            layer_id,
-                            hidden_states,
-                            topk_ids,
-                            topk_weights,
-                            cpu_slot,
-                            stream,
-                            local_expert_lo=_local_lo,
-                            local_expert_hi=_local_hi,
-                        )
-                        if ctx is not None:
-                            if _MOE_TRACE:
-                                _trace.hit("hook.begin.capture_armed")
-                                _trace.layer_hit(layer_id, "armed")
-                            ctx["use_cuda_graph_offload"] = True
-                            ctx["gctx"] = gctx
-                            # Update metrics during capture so atexit print
-                            # is not all-zeros.  These capture-time values
-                            # are a lower bound (replay runs many more times
-                            # but Python counters are not updated then).
-                            rt.metrics.record_pairs_seen(int(topk_ids.numel()))
-                            rt.metrics.record_offload(
-                                rt.local_rank,
-                                cpu_slot,
-                                ctx.get("num_tokens", 0),
-                            )
-                            return ctx
-                        if _MOE_TRACE:
-                            _trace.reason(
-                                "hook.begin.capture_skip",
-                                "gctx.begin_offload returned None",
-                            )
-                    else:
-                        if _MOE_TRACE:
-                            _trace.reason(
-                                "hook.begin.capture_skip",
-                                "cpu_slot=-1 (no expert assigned)",
-                            )
-                        # Only log once per rank
-                        _k = "_graph_slot_warn"
-                        if not getattr(begin_cpu_offload, _k, False):
-                            print(
-                                f"[cuda_graph_offload][capture] cpu_slot={cpu_slot} < 0, skipping",
-                                flush=True,
-                            )
-                            setattr(begin_cpu_offload, _k, True)
-            else:
-                if _MOE_TRACE:
-                    if gctx is None:
-                        _why = "cuda-graph offload ctx not created"
-                    elif not gctx.initialized:
-                        _why = "cuda-graph offload ctx not initialized"
-                    else:
-                        _why = "layer not registered with cuda-graph ctx"
-                    _trace.reason("hook.begin.capture_skip", _why)
-                # Log once why we're skipping
-                _k = "_graph_ctx_warn"
-                if not getattr(begin_cpu_offload, _k, False):
-                    _g_none = gctx is None
-                    _g_init = gctx.initialized if gctx else False
-                    _g_has = (
-                        gctx.has_layer(layer_id) if gctx and gctx.initialized else False
-                    )
-                    print(
-                        f"[cuda_graph_offload][capture] skipped: gctx_none={_g_none} init={_g_init} has_layer({layer_id})={_g_has}",
-                        flush=True,
-                    )
-                    setattr(begin_cpu_offload, _k, True)
-        except Exception as e:
-            if _MOE_TRACE:
-                _trace.exc("dispatch_hook.begin_cpu_offload/graph-capture", e)
-                _trace.reason("hook.begin.capture_skip", "exception (see sec.5)")
-            _k = "_graph_exc_warn"
-            if not getattr(begin_cpu_offload, _k, False):
-                import traceback
-
-                print(
-                    f"[cuda_graph_offload][capture] exception: {e}\n{traceback.format_exc()}",
-                    flush=True,
+            rt = get_cpu_offload_runtime()
+            if rt is None or not rt.is_active_locally():
+                return None
+            if gctx is None or not gctx.initialized or not gctx.has_layer(layer_id):
+                raise RuntimeError(f"CPU 图 offload 未就绪：layer={layer_id}")
+            cpu_slot = rt.local_cpu_slot(layer_id)
+            if cpu_slot < 0:
+                raise RuntimeError(f"CPU 图捕获前没有分配专家槽位：layer={layer_id}")
+            stream = torch.cuda.current_stream().cuda_stream
+            _local_lo, _local_hi = -1, -1
+            try:
+                from sglang.srt.eplb.expert_location import (
+                    get_global_expert_location_metadata,
                 )
-                setattr(begin_cpu_offload, _k, True)
+
+                _meta = get_global_expert_location_metadata()
+                if _meta is not None:
+                    _n_local = int(_meta.num_local_physical_experts)
+                    _local_lo = rt.local_rank * _n_local
+                    _local_hi = _local_lo + _n_local - 1
+            except Exception:
+                pass
+            ctx = gctx.begin_offload(
+                layer_id,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                cpu_slot,
+                stream,
+                local_expert_lo=_local_lo,
+                local_expert_hi=_local_hi,
+            )
+            if ctx is None:
+                raise RuntimeError(f"CPU 图 offload 捕获失败：layer={layer_id}")
+            if _MOE_TRACE:
+                _trace.hit("hook.begin.capture_armed")
+                _trace.layer_hit(layer_id, "armed")
+            ctx["use_cuda_graph_offload"] = True
+            ctx["gctx"] = gctx
+            rt.metrics.record_pairs_seen(int(topk_ids.numel()))
+            rt.metrics.record_offload(rt.local_rank, cpu_slot, ctx.get("num_tokens", 0))
+            return ctx
+        except Exception as e:
+            raise RuntimeError(f"CPU 图 offload 捕获失败：layer={layer_id}") from e
         return None
 
     # If the graph offload context is initialized, skip the eager path.
@@ -479,7 +397,7 @@ def begin_cpu_offload(
     slot_mask = cpu_topk_ids == cpu_slot  # [n_tokens, topk], one True per row
     cpu_slot_weight = cpu_topk_weights[slot_mask]  # [n_tokens]
     cpu_topk_ids = torch.full_like(cpu_topk_ids, -1)
-    cpu_topk_ids[:, 0] = cpu_slot
+    cpu_topk_ids[:, 0] = rt.engine.layer_spec(layer_id).cpu_expert_id(cpu_slot)
     cpu_topk_weights = torch.zeros_like(cpu_topk_weights)
     cpu_topk_weights[:, 0] = cpu_slot_weight
 

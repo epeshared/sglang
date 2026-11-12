@@ -78,183 +78,172 @@ class RunnerView:
             logger.info("[cuda_graph_offload] decode 图捕获已关闭，使用 eager 路径")
             return
 
-        try:
-            from sglang.srt.eplb.cpu_offload import get_cpu_offload_runtime
-            from sglang.srt.eplb.cpu_offload.cuda_graph_offload import (
-                init_cuda_graph_offload,
-            )
+        from sglang.srt.eplb.cpu_offload import get_cpu_offload_runtime
+        from sglang.srt.eplb.cpu_offload.cuda_graph_offload import (
+            init_cuda_graph_offload,
+        )
 
-            rt = get_cpu_offload_runtime()
-            if rt is None:
-                logger.warning("[cuda_graph_offload] skipped: runtime is None")
-                return
+        rt = get_cpu_offload_runtime()
+        if rt is None:
+            raise RuntimeError("CPU offload 已启用，但运行时未初始化")
+        if not rt.is_active_locally():
+            return
 
-            logger.info(
-                "[cuda_graph_offload] starting init on rank %d, "
-                "engine.initialized=%s, daemon=%s",
-                self.tp_rank,
-                getattr(rt.engine, "initialized", "?"),
-                "present" if getattr(rt.engine, "_daemon", None) else "absent",
-            )
+        logger.info(
+            "[cuda_graph_offload] starting init on rank %d, "
+            "engine.initialized=%s, daemon=%s",
+            self.tp_rank,
+            getattr(rt.engine, "initialized", "?"),
+            "present" if getattr(rt.engine, "_daemon", None) else "absent",
+        )
 
-            # Get model parameters for buffer sizing
-            hf_cfg = self.model_config.hf_config
-            hidden_size = getattr(hf_cfg, "hidden_size", 7168)
-            topk = getattr(hf_cfg, "num_experts_per_tok", 8)
-            _raw_max_hits = getattr(self.server_args, "cpu_offload_max_hits", 0)
-            gctx = init_cuda_graph_offload(
-                hidden_size=hidden_size,
-                topk=topk,
-                max_tokens=max_tokens,
-                max_spins=getattr(self.server_args, "cpu_offload_max_spin", 50_000_000),
-                max_hits=_raw_max_hits if _raw_max_hits > 0 else None,
-            )
-            if gctx is None:
-                logger.warning("[cuda_graph_offload] failed to initialize context")
-                return
+        # Get model parameters for buffer sizing
+        hf_cfg = self.model_config.hf_config
+        hidden_size = getattr(hf_cfg, "hidden_size", 7168)
+        topk = getattr(hf_cfg, "num_experts_per_tok", 8)
+        _raw_max_hits = getattr(self.server_args, "cpu_offload_max_hits", 0)
+        gctx = init_cuda_graph_offload(
+            hidden_size=hidden_size,
+            topk=topk,
+            max_tokens=max_tokens,
+            max_spins=getattr(self.server_args, "cpu_offload_max_spin", 50_000_000),
+            max_hits=_raw_max_hits if _raw_max_hits > 0 else None,
+        )
+        if gctx is None:
+            raise RuntimeError("CPU 图 offload 上下文初始化失败")
 
-            # Register layers with the graph offload context by borrowing
-            # the RemoteMOE instances from DaemonBackend.
-            engine = rt.engine
-            if not getattr(engine, "initialized", False):
-                logger.info(
-                    "[cuda_graph_offload] engine not yet initialized, "
-                    "skipping layer registration"
-                )
-                return
+        # Register layers with the graph offload context by borrowing
+        # the RemoteMOE instances from DaemonBackend.
+        engine = rt.engine
+        if not getattr(engine, "initialized", False):
+            raise RuntimeError("CPU 图 offload 的计算后端未初始化")
 
-            daemon = getattr(engine, "_daemon", None)
-            if daemon is None:
-                logger.warning("[cuda_graph_offload] no daemon backend attached")
-                return
+        daemon = getattr(engine, "_daemon", None)
+        if daemon is None:
+            raise RuntimeError("CPU 图 offload 未连接守护进程")
 
-            n_registered = 0
-            for layer_id in engine.registered_layers():
-                # Get the RemoteMOE instance from DaemonBackend
-                rm = daemon._layers.get(layer_id)
-                if rm is not None:
-                    if gctx.register_layer_from_daemon(layer_id, rm):
-                        n_registered += 1
-                else:
-                    # Fallback to old API (no-op in new implementation)
-                    gctx.register_layer(layer_id, daemon.slot_handle)
-                    n_registered += 1
+        n_registered = 0
+        for layer_id in engine.registered_layers():
+            # Get the RemoteMOE instance from DaemonBackend
+            rm = daemon._layers.get(layer_id)
+            if rm is None or not gctx.register_layer_from_daemon(
+                layer_id, rm, spec=engine.layer_spec(layer_id)
+            ):
+                raise RuntimeError(f"CPU 图 offload 层登记失败：layer={layer_id}")
+            n_registered += 1
 
-                # Ensure a cpu_slot is assigned BEFORE graph capture so the
-                # offload kernels get recorded.  The cpu_slot constant is
-                # baked into the CUDA graph at capture time (the comparison
-                # kernel ``topk_ids == cpu_slot`` records the scalar value),
-                # so it MUST be the correct per-rank expert id — not a shared
-                # placeholder like 0 (which would make all ranks filter the
-                # same expert and produce identical token counts).
-                # This is done per-layer since each MoE layer can have a
-                # different hot expert offloaded to CPU.
-                if rt.local_cpu_slot(layer_id) < 0:
-                    try:
-                        state = rt.registry.local_state()
-                        if state is not None and state.active:
-                            # Derive the per-rank initial slot from the expert
-                            # location metadata that was already built during
-                            # ModelRunner.__init__ (set_global_expert_location_
-                            # metadata is called before init_cuda_graph_offload).
-                            # We use the LAST local expert of this rank, which:
-                            #   (a) belongs to this rank's physical range, so
-                            #       masking it to -1 does not alias with any
-                            #       other rank's local computation, and
-                            #   (b) is a stable choice that survives across
-                            #       EPLB rebalances (it stays in the rank's pool).
-                            initial_slot = -1
+            # Ensure a cpu_slot is assigned BEFORE graph capture so the
+            # offload kernels get recorded.  The cpu_slot constant is
+            # baked into the CUDA graph at capture time (the comparison
+            # kernel ``topk_ids == cpu_slot`` records the scalar value),
+            # so it MUST be the correct per-rank expert id — not a shared
+            # placeholder like 0 (which would make all ranks filter the
+            # same expert and produce identical token counts).
+            # This is done per-layer since each MoE layer can have a
+            # different hot expert offloaded to CPU.
+            if rt.local_cpu_slot(layer_id) < 0:
+                try:
+                    state = rt.registry.local_state()
+                    if state is not None and state.active:
+                        # Derive the per-rank initial slot from the expert
+                        # location metadata that was already built during
+                        # ModelRunner.__init__ (set_global_expert_location_
+                        # metadata is called before init_cuda_graph_offload).
+                        # We use the LAST local expert of this rank, which:
+                        #   (a) belongs to this rank's physical range, so
+                        #       masking it to -1 does not alias with any
+                        #       other rank's local computation, and
+                        #   (b) is a stable choice that survives across
+                        #       EPLB rebalances (it stays in the rank's pool).
+                        initial_slot = -1
+                        try:
+                            meta = get_global_expert_location_metadata()
+                            if meta is not None:
+                                num_local = int(meta.num_local_physical_experts)
+                                phys = meta.physical_to_logical_map
+                                # physical_to_logical_map: (num_layers, num_phys)
+                                # rank r owns physical indices [r*num_local, (r+1)*num_local).
+                                # Use this layer's own row (per-layer mapping
+                                # can differ after EPLB rebalancing).
+                                num_layers_meta = phys.shape[0]
+                                row_idx = layer_id if layer_id < num_layers_meta else 0
+                                layer_row = phys[row_idx].tolist()
+                                phys_idx = self.tp_rank * num_local + (num_local - 1)
+                                if 0 <= phys_idx < len(layer_row):
+                                    eid = int(layer_row[phys_idx])
+                                    # Detect block-initialized (identity) EPLB map:
+                                    # if phys[row, phys_idx] == phys_idx, the map is still
+                                    # at its default block layout.  The actual model uses
+                                    # stride routing so this would point to the WRONG rank's
+                                    # GPU expert.  Fall through to the stride formula below.
+                                    if eid >= 0 and eid != phys_idx:
+                                        initial_slot = eid
+                        except Exception:
+                            pass
+
+                        if initial_slot < 0:
+                            # Metadata unavailable OR block-initialized map — use the
+                            # CONTIGUOUS BLOCK layout, which is what actually decides
+                            # ownership: rank r owns global expert ids
+                            # [r*s_gpu, (r+1)*s_gpu), so its last one is
+                            # (r+1)*s_gpu - 1. Both
+                            # FusedMoE._map_global_expert_id_to_local_expert_id
+                            # (weight placement) and StandardDispatcher.dispatch
+                            # (routing) compute exactly this range.
+                            #
+                            # This previously used the INTERLEAVED formula
+                            # ``tp_rank + (s_gpu-1)*ws`` on the belief that expert e
+                            # lives on rank e % world_size. That put EVERY rank's
+                            # cpu_slot inside the LAST rank's block, so masking it was
+                            # a no-op locally while the owning rank still ran it on
+                            # GPU -- every offloaded token counted twice after the TP
+                            # all-reduce. The block value also equals the ``phys_idx``
+                            # the metadata branch above computes, so both branches now
+                            # agree instead of contradicting each other.
                             try:
-                                meta = get_global_expert_location_metadata()
-                                if meta is not None:
-                                    num_local = int(meta.num_local_physical_experts)
-                                    phys = meta.physical_to_logical_map
-                                    # physical_to_logical_map: (num_layers, num_phys)
-                                    # rank r owns physical indices [r*num_local, (r+1)*num_local).
-                                    # Use this layer's own row (per-layer mapping
-                                    # can differ after EPLB rebalancing).
-                                    num_layers_meta = phys.shape[0]
-                                    row_idx = (
-                                        layer_id if layer_id < num_layers_meta else 0
+                                ne = (
+                                    getattr(
+                                        self.model_config.hf_config,
+                                        "num_experts",
+                                        0,
                                     )
-                                    layer_row = phys[row_idx].tolist()
-                                    phys_idx = self.tp_rank * num_local + (
-                                        num_local - 1
-                                    )
-                                    if 0 <= phys_idx < len(layer_row):
-                                        eid = int(layer_row[phys_idx])
-                                        # Detect block-initialized (identity) EPLB map:
-                                        # if phys[row, phys_idx] == phys_idx, the map is still
-                                        # at its default block layout.  The actual model uses
-                                        # stride routing so this would point to the WRONG rank's
-                                        # GPU expert.  Fall through to the stride formula below.
-                                        if eid >= 0 and eid != phys_idx:
-                                            initial_slot = eid
+                                    or 0
+                                )
+                                ws = self.tp_size or 1
+                                s_gpu = ne // ws if (ne > 0 and ws > 0) else 0
+                                if s_gpu > 0:
+                                    initial_slot = (self.tp_rank + 1) * s_gpu - 1
                             except Exception:
                                 pass
 
-                            if initial_slot < 0:
-                                # Metadata unavailable OR block-initialized map — use the
-                                # CONTIGUOUS BLOCK layout, which is what actually decides
-                                # ownership: rank r owns global expert ids
-                                # [r*s_gpu, (r+1)*s_gpu), so its last one is
-                                # (r+1)*s_gpu - 1. Both
-                                # FusedMoE._map_global_expert_id_to_local_expert_id
-                                # (weight placement) and StandardDispatcher.dispatch
-                                # (routing) compute exactly this range.
-                                #
-                                # This previously used the INTERLEAVED formula
-                                # ``tp_rank + (s_gpu-1)*ws`` on the belief that expert e
-                                # lives on rank e % world_size. That put EVERY rank's
-                                # cpu_slot inside the LAST rank's block, so masking it was
-                                # a no-op locally while the owning rank still ran it on
-                                # GPU -- every offloaded token counted twice after the TP
-                                # all-reduce. The block value also equals the ``phys_idx``
-                                # the metadata branch above computes, so both branches now
-                                # agree instead of contradicting each other.
-                                try:
-                                    ne = (
-                                        getattr(
-                                            self.model_config.hf_config,
-                                            "num_experts",
-                                            0,
-                                        )
-                                        or 0
-                                    )
-                                    ws = self.tp_size or 1
-                                    s_gpu = ne // ws if (ne > 0 and ws > 0) else 0
-                                    if s_gpu > 0:
-                                        initial_slot = (self.tp_rank + 1) * s_gpu - 1
-                                except Exception:
-                                    pass
-
-                            if initial_slot < 0:
-                                initial_slot = 0  # last-resort safe fallback
-
-                            state.assign_slot(layer_id, initial_slot)
-                            logger.info(
-                                "[cuda_graph_offload] pre-assigned initial "
-                                "cpu_slot=%d for graph capture (rank=%d, layer=%d)",
-                                initial_slot,
-                                self.tp_rank,
-                                layer_id,
+                        if initial_slot < 0:
+                            raise RuntimeError(
+                                f"无法确定 CPU 专家初始槽位：layer={layer_id}"
                             )
-                    except Exception:
-                        pass
 
-            logger.info(
-                "[cuda_graph_offload] registered %d layer(s) for "
-                "CUDA-graph-capturable CPU offload on rank %d",
-                n_registered,
-                self.tp_rank,
-            )
+                        state.assign_slot(layer_id, initial_slot)
+                        logger.info(
+                            "[cuda_graph_offload] pre-assigned initial "
+                            "cpu_slot=%d for graph capture (rank=%d, layer=%d)",
+                            initial_slot,
+                            self.tp_rank,
+                            layer_id,
+                        )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"CPU 初始槽位分配失败：layer={layer_id}"
+                    ) from exc
 
-        except Exception as exc:
-            logger.warning(
-                "[cuda_graph_offload] initialization failed (continuing "
-                "without graph-capturable offload): %s",
-                exc,
-            )
+            gctx.update_slot(layer_id, rt.local_cpu_slot(layer_id))
+
+        if n_registered == 0:
+            raise RuntimeError("CPU 图 offload 没有成功登记的专家层")
+        logger.info(
+            "[cuda_graph_offload] registered %d layer(s) for "
+            "CUDA-graph-capturable CPU offload on rank %d",
+            n_registered,
+            self.tp_rank,
+        )
 
 
 def validate_runner(runner):

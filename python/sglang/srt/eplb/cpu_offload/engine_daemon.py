@@ -535,6 +535,23 @@ class DaemonBackend:
         daemon_loads = daemon_loads_weights_from_disk()
 
         if not daemon_loads:
+            # 当前守护进程按层号共享权重缓存，不能把不同 rank 的局部分片混用。
+            local_numa = self._config.numa_for_rank(
+                self._host_rank,
+                world_size=self._world_size,
+                num_numa_nodes=self._num_numa_nodes,
+            )
+            active = self._config.active_ranks_on_numa(
+                local_numa,
+                world_size=self._world_size,
+                num_numa_nodes=self._num_numa_nodes,
+            )
+            if len(active) > 1:
+                raise RuntimeError(
+                    "同一 CPU 守护进程不能共享不同 rank 的局部专家权重；"
+                    "请设置 CPU_OFFLOAD_DAEMON_LOADS_WEIGHTS=1 并预载完整权重，"
+                    "或每个 NUMA 节点只启用一个 CPU rank"
+                )
             # All weight tensors must be CPU + contiguous (RemoteMOE memcpy's
             # raw bytes into the weight-SHM file).
             for name, t in (
