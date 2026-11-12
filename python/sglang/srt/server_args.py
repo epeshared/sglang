@@ -135,6 +135,7 @@ from sglang.srt.arg_groups.choices import (  # noqa: F401
     add_rl_on_policy_target_choices,
 )
 from sglang.srt.arg_groups.fields import collect_input_fields
+from sglang.srt.arg_groups.fields.cpu_experts import CpuOffloadFields
 from sglang.srt.arg_groups.fields.device import (
     Device,
 )
@@ -515,6 +516,7 @@ class ServerArgs:
 
 
 _INPUT_NAMESPACES = [
+    CpuOffloadFields,
     Model,
     ExecDeterministic,
     ExecDllm,

@@ -71,6 +71,16 @@ class EPLBManager:
 
     def on_forward_pass_end(self):
         next(self._main_generator)
+        # Tick the CPU offload fast loop (no-op if the runtime is absent
+        # or the interval has not elapsed). See dual-loop-eplb-design.md.
+        try:
+            from sglang.srt.eplb.cpu_offload import get_cpu_offload_runtime
+
+            rt = get_cpu_offload_runtime()
+            if rt is not None:
+                rt.tick_fast_loop()
+        except Exception as exc:  # never let the fast loop break EPLB
+            logger.warning("[cpu_offload] fast loop tick raised: %s", exc)
 
     def reset_generator(self):
         self._main_generator = self._entrypoint()

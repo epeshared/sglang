@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import os
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -94,6 +95,13 @@ _skip_attn_backend_init_warned = False
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
+
+_STEP_TRACE_ENABLED = os.environ.get("SGLANG_MOE_STEP_TRACE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def _build_forward_token_modalities(
@@ -890,6 +898,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
+    # 请求关联信息由 scheduler 提供；捕获批次保留默认值。
+    request_ids: list[str] | None = None
+    request_decode_steps: list[int] | None = None
+    request_id_source: str = "unavailable"
+
     @classmethod
     def init_new(
         cls,
@@ -1127,6 +1140,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.mrope_positions = ret.positions.unsqueeze(0).expand(3, -1)
             if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
+            if _STEP_TRACE_ENABLED:
+                from sglang.srt.eplb.cpu_offload.request_identity import attach
+
+                attach(ret, batch.reqs)
+
             return ret
 
         # A dLLM denoise pass rewrites a fixed-size block in place. Context
@@ -1263,6 +1281,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.dcp_kv_mask = (
                 ret.positions % parallel.attn_dcp_size == parallel.attn_dcp_rank
             )
+
+        if _STEP_TRACE_ENABLED:
+            from sglang.srt.eplb.cpu_offload.request_identity import attach
+
+            attach(ret, batch.reqs)
 
         return ret
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -388,6 +389,12 @@ class ModelRunner:
         draft_attention_backend: Optional[str] = None,
         load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
     ):
+        # pinned 沿用原入口的早期检查，禁止在 torch 导入后临时启用。
+        if os.environ.get("CPU_OFFLOAD_TRANSPORT") in ("pinned", "anonymous"):
+            from sglang._pinned_cpu_threads import require_bootstrap
+
+            require_bootstrap()
+
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         self.load_group = load_group
@@ -428,6 +435,17 @@ class ModelRunner:
         self.capture_tail_hooks = []
         # Called as hook(graph_runner, forward_batch) first inside each decode graph capture.
         self.capture_head_hooks = []
+        self._cpu_offload_hooks = None
+        if (
+            getattr(get_exec().moe, "enable_cpu_offload_fast_loop", False)
+            or getattr(get_exec().moe, "enable_ep_moe_heto", False)
+            or os.environ.get("CPU_OFFLOAD_TRANSPORT") in ("pinned", "anonymous")
+            or os.environ.get("SGLANG_MOE_STEP_TRACE", "").lower()
+            in ("1", "true", "yes", "on")
+        ):
+            from sglang.srt.eplb.cpu_offload import runner_hooks
+
+            self._cpu_offload_hooks = runner_hooks
         self.page_size = get_schedule().page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -487,8 +505,6 @@ class ModelRunner:
             if not is_mps_device:
                 torch.get_device_module(self.device).set_device(get_device().gpu_id)
         except Exception:
-            import os
-
             logger.warning(
                 f"Context: {self.device=} {get_device().gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {get_parallel().tp_rank=} {get_parallel().tp_size=}"
             )
@@ -555,6 +571,8 @@ class ModelRunner:
         # For weight updates
         self.init_weight_updater()
         self.init_weight_exporter()
+        if self._cpu_offload_hooks is not None:
+            self._cpu_offload_hooks.finish_initialization(self)
 
     def init_startup_observability(self) -> None:
         self.weight_load_time = 0.0
@@ -748,6 +766,8 @@ class ModelRunner:
         self.expert_location_updater = ExpertLocationUpdater()
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
+        if self._cpu_offload_hooks is not None:
+            self._cpu_offload_hooks.prepare_runner(self)
         self.sampler = create_sampler()
         self.load_model()
         if self.model_config.is_layer_types_hybrid_swa:
@@ -771,6 +791,8 @@ class ModelRunner:
             draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
+        if self._cpu_offload_hooks is not None:
+            self._cpu_offload_hooks.register_runner_model(self)
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
@@ -1241,6 +1263,8 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        if self._cpu_offload_hooks is not None:
+            self._cpu_offload_hooks.prepare_graphs(self)
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():
@@ -1936,6 +1960,11 @@ class ModelRunner:
         with (
             canary_ctx,
             step_span_ctx,
+            (
+                self._cpu_offload_hooks.forward_scope(forward_batch)
+                if self._cpu_offload_hooks is not None
+                else contextlib.nullcontext()
+            ),
             record_ctx,
             recorder.with_forward_pass(
                 self.forward_pass_id,
@@ -1978,6 +2007,8 @@ class ModelRunner:
         # should_advance_eplb_counter is always True on non-hip platform
         if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
             self.eplb_manager.on_forward_pass_end()
+        if self._cpu_offload_hooks is not None:
+            self._cpu_offload_hooks.finish_forward(self)
 
         if dumper.may_enable:
             dumper.step()

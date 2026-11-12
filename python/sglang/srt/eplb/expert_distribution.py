@@ -199,6 +199,16 @@ class ExpertDistributionRecorder(ABC):
     def dump_record(self, output_mode: _OutputMode = "file"):
         self._on_not_implemented()
 
+    def get_accumulated_physical_counts(self) -> Optional[torch.Tensor]:
+        """Return accumulated [num_layers, num_physical_experts] token counts
+        without clearing the buffer.  Used by the CPU offload fast loop for
+        frequent, non-destructive sampling of expert traffic.
+
+        Returns None when no data has been recorded yet or when the
+        current recorder mode does not maintain a physical-count buffer.
+        """
+        return None
+
     @property
     def recording(self):
         return False
@@ -389,6 +399,30 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         return output
+
+    def get_accumulated_physical_counts(self) -> Optional[torch.Tensor]:
+        """Return the sum of buffered [num_layers, num_physical_experts] tensors
+        without clearing the accumulator.  Non-destructive: EPLB's own
+        rebalancing cycle is unaffected.
+
+        Shape: [num_layers, num_physical_experts].  All values are physical
+        expert token counts summed over the current circular buffer window.
+        Returns None if the accumulator has no data yet or does not carry a
+        physical-count buffer (e.g. per_token / per_pass modes).
+        """
+        try:
+            buf = self._accumulator._global_physical_count_of_buffered_step
+            data = buf.get_all()  # [buf_size, num_layers, num_physical_experts]
+            if data is None or data.numel() == 0:
+                return None
+            result = data.sum(0)  # [num_layers, num_physical_experts]
+            if result.sum().item() == 0:
+                return None
+            return result
+        except AttributeError:
+            # _global_physical_count_of_buffered_step only exists on
+            # _StatAccumulator; other modes return None gracefully.
+            return None
 
     @property
     def recording(self):

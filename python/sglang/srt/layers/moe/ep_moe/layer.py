@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
@@ -59,6 +60,13 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 logger = logging.getLogger(__name__)
+
+_MOE_TRACE = os.environ.get("SGLANG_MOE_TRACE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 class DeepEPMoE(FusedMoE):

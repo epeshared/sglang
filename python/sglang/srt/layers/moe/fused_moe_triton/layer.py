@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import os
 from enum import Enum
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple
@@ -76,7 +77,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
-    get_exec,
     get_flags,
     get_global_dwdp_manager,
     get_parallel,
@@ -284,6 +284,20 @@ def create_moe_dispatcher(
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
 
 
+_MOE_TRACE = os.environ.get("SGLANG_MOE_TRACE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_STEP_TRACE_ENABLED = os.environ.get("SGLANG_MOE_STEP_TRACE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
     CHANNEL = "channel"
@@ -424,6 +438,13 @@ class FusedMoE(torch.nn.Module):
         self.serves_fused_mxfp4 = serves_fused_mxfp4
         self.layer_name = prefix
         self.layer_id = layer_id
+        from sglang.srt.runtime_context import get_exec
+
+        self._cpu_offload_observe = (
+            getattr(get_exec().moe, "enable_cpu_offload_fast_loop", False)
+            or _MOE_TRACE
+            or _STEP_TRACE_ENABLED
+        )
         self.is_draft = get_flags().moe.in_speculative_scope
         self.uses_expert_location = uses_expert_location and not self.is_draft
         self.top_k = top_k
@@ -1761,6 +1782,14 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
+        cpu_context = step_layer = None
+        if self._cpu_offload_observe:
+            from sglang.srt.eplb.cpu_offload import layer_hooks
+
+            cpu_context, topk_output, step_layer = layer_hooks.begin_layer(
+                self, hidden_states, topk_output
+            )
+
         if self._dwdp_bound:
             dwdp_mgr = get_global_dwdp_manager()
             dwdp_mgr.wait_prefetch(self.layer_id)
@@ -1769,9 +1798,15 @@ class FusedMoE(torch.nn.Module):
             hidden_states, topk_output, pre_quant_input
         )
 
+        if self._cpu_offload_observe:
+            layer_hooks.dispatch_done(step_layer, dispatch_output)
+
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
         )
+
+        if self._cpu_offload_observe:
+            layer_hooks.compute_done(step_layer)
 
         if self._dwdp_bound:
             dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
@@ -1786,8 +1821,16 @@ class FusedMoE(torch.nn.Module):
                 ..., :origin_hidden_states_dim
             ].contiguous()
 
+        if self._cpu_offload_observe:
+            final_hidden_states = layer_hooks.combine_cpu(
+                cpu_context, final_hidden_states
+            )
+
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if self._cpu_offload_observe:
+            layer_hooks.end_layer(step_layer)
 
         return final_hidden_states
 

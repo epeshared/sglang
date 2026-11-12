@@ -1,5 +1,6 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/kernels/ops/attention/flash_attn/cute|python/sglang/kernels/jit/csrc/diffusion/vsa_block_sparse_sm100)
+# legacy 中保存旧版静态布局原件，按字节保留，不参加自动格式改写。
+exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/kernels/ops/diffusion/render|python/sglang/kernels/ops/attention/flash_attn/cute|python/sglang/kernels/jit/csrc/diffusion/vsa_block_sparse_sm100|python/sglang/srt/eplb/cpu_offload/legacy/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

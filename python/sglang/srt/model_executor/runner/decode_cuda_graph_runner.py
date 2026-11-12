@@ -29,6 +29,7 @@ import contextlib
 import dataclasses
 import inspect
 import logging
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
@@ -138,6 +139,13 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+_STEP_TRACE_ENABLED = os.environ.get("SGLANG_MOE_STEP_TRACE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 @contextlib.contextmanager
@@ -1548,12 +1556,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
-                self.backend.capture_one(
-                    shape_key,
-                    run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                if _STEP_TRACE_ENABLED:
+                    from sglang.srt.eplb.cpu_offload import graph_hooks
+
+                    graph_hooks.capture(
+                        self.backend,
+                        self,
+                        shape_key,
+                        run_once,
+                        forward_batch,
+                        num_tokens,
+                        post_warmup_hook,
+                    )
+                else:
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach
@@ -2126,6 +2147,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            if _STEP_TRACE_ENABLED:
+                from sglang.srt.eplb.cpu_offload import graph_hooks
+
+                graph_hooks.before_replay(self)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:

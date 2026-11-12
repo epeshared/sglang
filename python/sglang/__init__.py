@@ -14,6 +14,12 @@ from sglang.srt.environ import (
 
 _redirect_third_party_caches()
 
+# 在线程库初始化之前应用已验证的 pinned 线程限制。
+from sglang._pinned_cpu_threads import bootstrap as _bootstrap_pinned_cpu_threads
+
+_bootstrap_pinned_cpu_threads()
+del _bootstrap_pinned_cpu_threads
+
 from sglang._logging_once import install_logging_once as _install_logging_once
 
 _install_logging_once()
