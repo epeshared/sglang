@@ -72,6 +72,19 @@ class LayerSpec:
     norm_topk_prob: bool = True
     n_group: int = 1
     topk_group: int = 1
+    expert_id_offset: int = 0
+
+    def cpu_expert_id(self, global_id: int) -> int:
+        """将全局路由编号换成 CPU 权重下标；全量权重的偏移为零。"""
+        if global_id < 0:
+            return -1
+        local_id = int(global_id) - self.expert_id_offset
+        if not 0 <= local_id < self.num_experts:
+            raise ValueError(
+                f"CPU 专家编号越界：layer={self.layer_id}, global_id={global_id}, "
+                f"offset={self.expert_id_offset}, count={self.num_experts}"
+            )
+        return local_id
 
 
 @dataclass
@@ -633,3 +646,7 @@ class CpuOffloadEngine:
         if self._daemon is not None:
             return self._daemon.registered_layers()
         return sorted(self._layers)
+
+    def layer_spec(self, layer_id: int) -> LayerSpec:
+        """返回登记时的 CPU 权重布局，供 eager 和图路径共同使用。"""
+        return self._layer_specs[layer_id]

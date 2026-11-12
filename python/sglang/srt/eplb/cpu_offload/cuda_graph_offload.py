@@ -157,6 +157,9 @@ class CudaGraphOffloadContext:
         # MoE layer can have an independently-chosen hot expert offloaded
         # to CPU instead of every layer on a rank sharing one global slot.
         self._cpu_slot_bufs: dict[int, torch.Tensor] = {}
+        # 路由匹配用全局编号；CPU 计算和预取用权重下标。
+        self._cpu_weight_slot_bufs: dict[int, torch.Tensor] = {}
+        self._layer_specs: dict = {}
 
         # Dedicated fast-loop expert traffic counter: one persistent
         # [_EXPERT_ACC_SIZE] int64 GPU tensor PER LAYER, keyed by layer_id.
@@ -430,7 +433,9 @@ class CudaGraphOffloadContext:
         # for the old MappedHostCallback path.
         return True
 
-    def register_layer_from_daemon(self, layer_id: int, remote_moe: object) -> bool:
+    def register_layer_from_daemon(
+        self, layer_id: int, remote_moe: object, *, spec=None
+    ) -> bool:
         """Store a reference to the DaemonBackend's RemoteMOE for this layer.
 
         Shared device buffers:
@@ -468,6 +473,14 @@ class CudaGraphOffloadContext:
             self._expert_count_accs[layer_id] = torch.zeros(
                 512, dtype=torch.int64, device="cuda"
             )
+
+        if spec is not None:
+            self._layer_specs[layer_id] = spec
+        self._cpu_weight_slot_bufs[layer_id] = (
+            self._cpu_slot_bufs[layer_id].clone()
+            if spec is not None and spec.expert_id_offset
+            else self._cpu_slot_bufs[layer_id]
+        )
 
         if _MOE_TRACE:
             # Re-record so the reported layer count is the final one.
@@ -515,8 +528,13 @@ class CudaGraphOffloadContext:
         """
         buf = self._cpu_slot_bufs.get(layer_id)
         if buf is not None:
+            spec = self._layer_specs.get(layer_id)
+            weight_id = spec.cpu_expert_id(expert_id) if spec is not None else expert_id
             safe_val = int(expert_id) if expert_id >= 0 else 0x7FFF
             buf[0] = safe_val
+            weight_buf = self._cpu_weight_slot_bufs.get(layer_id)
+            if weight_buf is not None and weight_buf is not buf:
+                weight_buf[0] = weight_id if weight_id >= 0 else 0x7FFF
             if _STEP_TRACE_ENABLED:
                 from sglang.srt.eplb.cpu_offload.step_trace import note_plan_update
 
@@ -586,7 +604,7 @@ class CudaGraphOffloadContext:
                         flush=True,
                     )
                 return
-            next_slot_buf = self._cpu_slot_bufs.get(next_layer_id)
+            next_slot_buf = self._cpu_weight_slot_bufs.get(next_layer_id)
             if next_slot_buf is None:
                 if first_log:
                     print(
@@ -795,6 +813,7 @@ class CudaGraphOffloadContext:
         # layer_id is already known to be in self._layers above.
         expert_count_acc = self._expert_count_accs.get(layer_id)
         cpu_slot_buf = self._cpu_slot_bufs.get(layer_id)
+        cpu_weight_slot_buf = self._cpu_weight_slot_bufs.get(layer_id, cpu_slot_buf)
         if cpu_slot_buf is None:
             if _MOE_TRACE:
                 _trace.reason("gctx.begin.reject", "missing per-layer cpu_slot buffer")
@@ -1023,7 +1042,7 @@ class CudaGraphOffloadContext:
                         int(self._compact_weights_buf.data_ptr()),
                         int(self._compact_ids_buf.data_ptr()),
                         int(self._hit_indices_buf.data_ptr()),
-                        int(cpu_slot_buf.data_ptr()),
+                        int(cpu_weight_slot_buf.data_ptr()),
                         self.max_hits,
                         self.hidden_size,
                         self.topk,
@@ -1037,7 +1056,7 @@ class CudaGraphOffloadContext:
                         int(self._compact_weights_buf.data_ptr()),
                         int(self._compact_ids_buf.data_ptr()),
                         int(self._hit_indices_buf.data_ptr()),
-                        int(cpu_slot_buf.data_ptr()),
+                        int(cpu_weight_slot_buf.data_ptr()),
                         self.max_hits,
                         self.hidden_size,
                         self.topk,
@@ -1045,14 +1064,9 @@ class CudaGraphOffloadContext:
             except Exception as _ce:
                 if _MOE_TRACE:
                     _trace.exc("cuda_graph_offload.begin_offload/compaction", _ce)
-                logger.warning(
-                    "[cuda_graph_offload] compaction kernels failed: %s", _ce
-                )
-                # Fall back: compact_ids/weights already have safe defaults
-                # (-1 / 0) from initialisation; daemon will treat all rows as
-                # inactive and zero the output.
-                self._compact_ids_buf.fill_(-1)
-                self._compact_weights_buf.zero_()
+                raise RuntimeError(
+                    f"CPU 图 offload 压紧输入失败：layer={layer_id}"
+                ) from _ce
 
             # ---- SHM kernel path: D2H + fence + submit ----
             # Submit max_hits rows from compact buffers.  has_hit_dev lets the

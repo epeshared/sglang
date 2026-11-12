@@ -163,9 +163,11 @@ class TestGraphLifecycle(unittest.TestCase):
                 events.append("暖机")
                 kwargs["post_warmup_hook"]()
                 events.append("正式捕获")
+                run_once()
                 raise RuntimeError("测试捕获失败")
 
         with (
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
             patch.object(
                 graph_hooks.step_trace, "prepare_graph_capture", return_value=state
             ),
@@ -191,7 +193,7 @@ class TestGraphLifecycle(unittest.TestCase):
                 lambda: events.append("原有暖机钩子"),
             )
         self.assertEqual(
-            events, ["暖机", "原有暖机钩子", "开始记录", "正式捕获", "结束记录"]
+            events, ["暖机", "原有暖机钩子", "正式捕获", "开始记录", "结束记录"]
         )
 
     def test_padding_uses_the_actual_token_count(self):
