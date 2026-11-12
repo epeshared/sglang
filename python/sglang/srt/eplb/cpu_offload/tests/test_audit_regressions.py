@@ -20,7 +20,8 @@ from sglang.srt.eplb.cpu_offload import (
     step_trace,
 )
 from sglang.srt.eplb.cpu_offload.config import CpuOffloadConfig
-from sglang.srt.eplb.cpu_offload.engine import CpuOffloadEngine, LayerSpec
+from sglang.srt.eplb.cpu_offload.engine import CpuOffloadEngine, LayerSpec, LayerWeights
+from sglang.srt.eplb.cpu_offload.engine_daemon import DaemonBackend
 from sglang.srt.eplb.cpu_offload.tests.test_fused_prepare import (
     LAYER,
     H,
@@ -32,6 +33,32 @@ from sglang.srt.eplb.cpu_offload.tests.test_fused_prepare import (
 
 
 class ExpertNumberingTests(unittest.TestCase):
+    def test_shared_daemon_requires_full_weights(self):
+        config = CpuOffloadConfig(
+            enable_cpu_offload_fast_loop=True, cpu_active_ranks=[0, 1]
+        )
+        for full_weights, nodes in ((False, 1), (True, 1), (False, 2)):
+            with self.subTest(full_weights=full_weights, nodes=nodes):
+                backend = DaemonBackend(
+                    config, host_rank=1, world_size=2, num_numa_nodes=nodes
+                )
+                backend._initialized = True
+                backend._slot_id = 0
+                backend._remote_moe_cls = MagicMock()
+                weights = LayerWeights(*(torch.ones(2, 2) for _ in range(4)))
+                spec = LayerSpec(0, 2, 1, 128, 128)
+                with patch(
+                    "sglang.srt.eplb.cpu_offload.engine.daemon_loads_weights_from_disk",
+                    return_value=full_weights,
+                ):
+                    if not full_weights and nodes == 1:
+                        with self.assertRaisesRegex(RuntimeError, "不能共享"):
+                            backend.register_layer(spec, weights)
+                        backend._remote_moe_cls.assert_not_called()
+                    else:
+                        backend.register_layer(spec, weights)
+                        backend._remote_moe_cls.assert_called_once()
+
     def test_rank_local_weights_receive_local_ids(self):
         for full_weights, expected in ((False, 1), (True, 3)):
             with self.subTest(full_weights=full_weights):
