@@ -1,4 +1,4 @@
-"""少量层验证适配器：使用正式 RemoteMOE CUDA 通道，不启用图捕获。"""
+"""Small-layer validation adapter using the production RemoteMOE CUDA transport without graph capture."""
 
 import torch
 

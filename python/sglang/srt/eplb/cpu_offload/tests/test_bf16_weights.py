@@ -1,4 +1,4 @@
-"""验证 Hy4 原始打包权重的索引、专家顺序及下载完整性。"""
+"""Validate indexing, expert order, and download integrity for raw packed Hy4 weights."""
 
 import hashlib
 import json

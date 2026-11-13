@@ -1,4 +1,4 @@
-"""独立的逐专家 GPU 参考计算，不调用待测 CPU 内核。"""
+"""Independent per-expert GPU reference without calls to the CPU kernel under test."""
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +22,7 @@ def forward(hidden, gate_up, down, topk_ids, topk_weights, limit):
 
 
 def error_metrics(actual, expected):
-    # 只在统计时使用双精度，避免大张量的余弦值因归约舍入略大于 1。
+    # Use double precision for metrics to avoid cosine values above 1 due to reduction rounding.
     a, b = actual.detach().double().cpu(), expected.detach().double().cpu()
     return {
         "finite": bool(torch.isfinite(a).all() and torch.isfinite(b).all()),

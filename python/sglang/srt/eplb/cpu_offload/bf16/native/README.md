@@ -1,37 +1,37 @@
-# 原始 BF16 CPU 内核与守护进程补丁
+# Raw BF16 CPU kernel and daemon patch
 
-> 摘要｜此补丁增加原始 BF16 张量入口、Hy4 SwiGLU 限幅和正式共享内存通道的少量层验证。完整模型服务的 BF16 offload 仍未接通。
+> Summary: raw BF16 tensors, Hy4 SwiGLU clipping, and small-layer validation over the production shared-memory transport. Full-model BF16 offload is not yet integrated.
 
-基线是 `intel-sandbox/moe-cpu-engine-xtang` 的 `3491bc78b670309464960fe2b3fd739114acb294`。在独立本地工作树应用 [01-raw-bf16-swiglu.patch](01-raw-bf16-swiglu.patch)，本地 commit 后同步到远端编译。补丁同时包含原生回归测试。
+Apply [01-raw-bf16-swiglu.patch](01-raw-bf16-swiglu.patch) to `intel-sandbox/moe-cpu-engine-xtang` at `3491bc78b670309464960fe2b3fd739114acb294` in an isolated local worktree. Commit locally before synchronizing to the build machine. The patch includes native regression tests.
 
 ```bash
-git apply --check /绝对路径/01-raw-bf16-swiglu.patch
-git apply /绝对路径/01-raw-bf16-swiglu.patch
-# 完成本地 commit 和同步后，在对应 GPU 环境执行：
+git apply --check /absolute/path/01-raw-bf16-swiglu.patch
+git apply /absolute/path/01-raw-bf16-swiglu.patch
+# After committing and synchronizing, build in the target GPU environment:
 cd ext
 python setup.py build_ext --inplace
 PYTHONPATH="$PWD" python ../tests/test_bf16_experts.py
 ```
 
-新增 `fused_experts_bf16_cpu` 接收原始 CPU BF16 张量，复用 BF16 小矩阵和 AMX 批量计算路径，不将权重转换为 FP8 或 INT8。gate 分支截上界，up 分支截到正负限值。无限限值保留旧入口计算行为；原有 `fused_experts_cpu` 参数不变。
+`fused_experts_bf16_cpu` accepts raw CPU BF16 tensors and reuses the BF16 small-matrix and AMX batch paths without converting weights to FP8 or INT8. The gate branch is clipped only above the limit; the up branch is clipped symmetrically. An infinite limit preserves existing computation. The `fused_experts_cpu` signature is unchanged.
 
-从本 SGLang 副本的 `python/` 目录运行真实权重对照。将配套扩展的 `ext/` 目录加入 `PYTHONPATH`，并确认导入的是新编译模块：
+Run real-weight validation from this SGLang checkout's `python/` directory. Add the matching extension's `ext/` directory to `PYTHONPATH` and verify that the newly built module is imported:
 
 ```bash
 python -m sglang.srt.eplb.cpu_offload.bf16.validate \
   --model-path /data/Hy4-preview --layers 1 2 \
-  --output /运行结果目录/hy4-bf16.json
+  --output /results/hy4-bf16.json
 ```
 
-对照使用两个 MoE 层中的真实专家权重、合成隐状态和固定路由；参考端是逐专家 PyTorch GPU 计算。每个使用的完整分片都会对照 `.download/verified/` 下载回执重新计算 SHA256。报告必须保留失败结果。
+The comparison uses real expert weights from two MoE layers, synthetic hidden states, and fixed routing. The reference is an independent per-expert PyTorch GPU implementation. Each complete shard is rehashed against its `.download/verified/` receipt. Preserve failed results in the report.
 
-默认判据预先固定为：CPU 和混合输出相对二范数误差均不超过 3%，余弦相似度不低于 0.999，输出有限，且每层至少一组输入实际触发限幅。这是本阶段数值筛查标准，不等于完整模型质量标准；默认进程内模式不包含 CPU 守护进程通信，通信验证使用下节的独立模式；两种模式都不包含注意力、共享专家或真实模型生成的验收。
+The predefined criteria require relative L2 error no greater than 3%, cosine similarity at least 0.999, finite CPU and hybrid outputs, and at least one input exercising clipping in each layer. These are numerical screening criteria, not full-model quality criteria. The default in-process mode does not exercise daemon communication; use the mode below for that. Neither mode validates attention, shared experts, or full-model generation.
 
-## 正式通信通道验证
+## Production transport validation
 
-补丁还包含 CPU 仓库 `9311c92` 的守护进程适配。客户端和服务端均须重编译并使用这套扩展；Python 模块随 `setup.py` 安装，源码运行时把对应 `ext/` 加入 `PYTHONPATH`。权重上传使用独立操作码 4、权重文件版本 2；旧服务会拒绝，不会把 BF16 当成 FP8。版本、形状、大小和限幅不一致时拒绝，原始上传副本在服务端完成打包后释放。
+The patch also includes the daemon integration introduced through CPU commit `9311c92`, with English comments and docstrings. Rebuild both client and daemon with this extension. Python modules are installed by `setup.py`; for source execution, add the matching `ext/` directory to `PYTHONPATH`. Weight uploads use opcode 4 and weight-file version 2. Older daemons reject the request rather than interpreting BF16 as FP8. Version, shape, size, or clipping-limit mismatches are rejected. The raw upload copy is released after daemon-side packing completes.
 
-在独立终端启动一个测试守护进程，使用未被其它实验占用的前缀：
+Start a dedicated test daemon in a separate terminal with a prefix that is not used by other experiments:
 
 ```bash
 ENABLE_NUMA=0 MOE_KERNEL_BACKEND=torch MOE_DTYPE=bf16 \
@@ -41,8 +41,8 @@ python -m cpu_expertd_main --socket 0 --num-workers 1 \
   --shm-prefix /dev/shm/hy4-bf16-test
 ```
 
-然后从 SGLang 的 `python/` 目录执行上面的数值对照命令，额外传入 `--daemon-prefix /dev/shm/hy4-bf16-test`。该模式通过正式 CUDA 提交、等待和返回通道调用 CPU 守护进程；每次调用检查错误码、请求完成序号及真实计算计数，报告保存前后计数。完成后停止自己启动的守护进程。
+Then run the validation command above from SGLang's `python/` directory with `--daemon-prefix /dev/shm/hy4-bf16-test`. This uses the production CUDA submit, wait, and return path. Each call checks the error code, completion sequence, and actual computation count; the report saves counters before and after validation. Stop the daemon you started when finished.
 
-协议测试在 CPU 仓库运行 `python tests/test_bf16_weight_protocol.py`；连接测试使用 `HY4_TEST_SHM_PREFIX=/dev/shm/hy4-bf16-test python tests/test_bf16_daemon.py`。连接测试使用层号 101—103，不能对正在运行模型的服务执行。
+Run `python tests/test_bf16_weight_protocol.py` in the CPU repository for protocol tests. Run `HY4_TEST_SHM_PREFIX=/dev/shm/hy4-bf16-test python tests/test_bf16_daemon.py` for connected tests. The latter use layer IDs 101–103 and must not target a daemon serving a model.
 
-当前只验单客户端、单 worker、CPU 完整局部专家张量（TP=1），使用合成隐状态和固定路由，不捕获 CUDA Graph。重复加载已占用的层号会拒绝，需要新进程或新层号。此模式补齐少量层的通信验证，不放开正式 runner 的 BF16 保护，也不实现完整冷热权重加载、动态专家迁移或性能验收。
+The tested configuration has one client, one worker, complete local CPU expert tensors (TP=1), synthetic hidden states, fixed routing, and no CUDA Graph capture. Reloading an occupied layer ID is rejected; use a new process or a different layer ID. This mode validates small-layer communication. It does not remove the runner's BF16 guard or implement full-model hot/cold loading, dynamic expert migration, or performance acceptance.

@@ -1,4 +1,4 @@
-"""用真实 Hy4 权重比较 CPU、GPU 和混合专家输出；不代表完整模型验收。"""
+"""Compare CPU, GPU, and hybrid experts using real Hy4 weights; not full-model validation."""
 
 import argparse
 import hashlib
@@ -123,7 +123,7 @@ def main():
                     reference, clipped = forward(
                         gh, gpu_gate_up, gpu_down, gi, gw, weights.swiglu_limit
                     )
-                    # 固定把局部专家 0 分给 CPU，其余留在 GPU，覆盖排除和加回的次序。
+                    # Assign local expert 0 to CPU and the rest to GPU to check exclusion and recombination.
                     cpu_ids = ids.masked_fill(ids != 0, -1)
                     gpu_ids = gi.masked_fill(gi == 0, -1)
                     cpu_part = cpu.forward(hidden, cpu_ids, routing)
