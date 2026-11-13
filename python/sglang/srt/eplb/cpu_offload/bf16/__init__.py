@@ -1,1 +1,1 @@
-"""Hy4 原始 BF16 专家的加载与数值验证入口。"""
+"""Loading and numerical validation for raw Hy4 BF16 experts."""

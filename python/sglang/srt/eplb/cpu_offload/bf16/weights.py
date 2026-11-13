@@ -1,4 +1,4 @@
-"""按 safetensors 索引读取 Hy4 打包专家，保持原始 BF16 精度。"""
+"""Read packed Hy4 experts through the safetensors index while preserving raw BF16 weights."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class ExpertWeights:
 
 
 def verify_shard(path: Path) -> dict:
-    """对照下载器回执重新计算整个分片的哈希，拒绝尚未完成的下载。"""
+    """Rehash the complete shard against its download receipt and reject incomplete downloads."""
     receipt_path = path.parent / ".download" / "verified" / (path.name + ".json")
     receipt = json.loads(receipt_path.read_text())
     if path.stat().st_size != receipt["字节数"]:
@@ -37,7 +37,7 @@ def verify_shard(path: Path) -> dict:
 
 
 def load_layer(model_path, layer_id, expert_ids, *, verify=False, verified=None):
-    """只复制指定专家；返回顺序就是 CPU 局部权重下标的顺序。"""
+    """Copy only selected experts; their returned order defines local CPU weight indices."""
     from safetensors import safe_open
 
     root = Path(model_path)

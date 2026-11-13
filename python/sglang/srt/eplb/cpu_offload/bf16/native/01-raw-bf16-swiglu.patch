@@ -1,10 +1,10 @@
 diff --git a/ext/bf16_weight_loader.h b/ext/bf16_weight_loader.h
 new file mode 100644
-index 0000000..9343543
+index 0000000..5ea3e4f
 --- /dev/null
 +++ b/ext/bf16_weight_loader.h
 @@ -0,0 +1,60 @@
-+// 由 cpu_expertd.cpp 引入；复用正式槽位，独立验证原始 BF16 权重协议。
++// Included by cpu_expertd.cpp; validates the raw BF16 weight protocol over production slots.
 +static std::shared_ptr<LayerSlot> load_bf16_layer(cpu_offload::SlotHandle& slot) {
 +    auto* p = slot.hdr->req_params;
 +    const int layer = (int32_t)p[0], e = (int32_t)p[1], k = (int32_t)p[2];
@@ -66,11 +66,11 @@ index 0000000..9343543
 +}
 diff --git a/ext/bf16_weight_protocol.py b/ext/bf16_weight_protocol.py
 new file mode 100644
-index 0000000..44cab95
+index 0000000..1831a15
 --- /dev/null
 +++ b/ext/bf16_weight_protocol.py
 @@ -0,0 +1,93 @@
-+"""经既有共享内存槽位上传原始 BF16；操作码 4 与权重协议 v2 配套。"""
++"""Upload raw BF16 through existing shared-memory slots using opcode 4 and weight protocol v2."""
 +
 +import ctypes
 +import math
@@ -82,7 +82,7 @@ index 0000000..44cab95
 +
 +
 +def upload(remote, gate_up, down, swiglu_limit):
-+    """仅接收有形状和精度信息的张量，防止指针大小误判导致越界读取。"""
++    """Require typed, shaped tensors to prevent out-of-bounds reads from incorrect pointer sizes."""
 +    from cpu_offload_remote_moe import _engine, _WEIGHT_HDR_FMT, _WEIGHT_MAGIC
 +
 +    if "error_code" not in _engine.cpu_client_slot_info(remote._handle):
@@ -161,10 +161,10 @@ index 0000000..44cab95
 +        remote._weights_loaded = True
 +    finally:
 +        os.close(fd)
-+        # v2 在应答前已经完成打包，服务端不再持有原始映射。
++        # Protocol v2 completes packing before acknowledging; the daemon no longer retains the raw mapping.
 +        os.unlink(path)
 diff --git a/ext/cpu/moe.cpp b/ext/cpu/moe.cpp
-index 7b9a954..023dc5a 100644
+index 7b9a954..92897da 100644
 --- a/ext/cpu/moe.cpp
 +++ b/ext/cpu/moe.cpp
 @@ -2,6 +2,8 @@
@@ -180,7 +180,7 @@ index 7b9a954..023dc5a 100644
    return num_tokens_post_pad;
  }
 
-+// Hy4 的 gate 只截上界，up 截到 [-limit, limit]；无限限值保留旧计算路径。
++// Hy4 clips gate above limit and up to [-limit, limit]; infinity preserves the existing path.
 +template <typename Vec>
 +inline void clamp_swiglu(Vec& gate, Vec& up, float limit) {
 +  if (std::isfinite(limit)) {
@@ -321,7 +321,7 @@ index 7b9a954..023dc5a 100644
    return out_hidden_states;
  }
 
-+// 保留原绑定和调用约定，旧 FP8／INT8／不限幅 BF16 路径仍传无限限值。
++// Preserve existing bindings and calling conventions; FP8, INT8, and unclipped BF16 use infinity.
 +at::Tensor fused_experts_cpu(
 +    at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
 +    at::Tensor& topk_weights, at::Tensor& topk_ids,
@@ -336,7 +336,7 @@ index 7b9a954..023dc5a 100644
 +      a1_scale, a2_scale, is_vnni, std::numeric_limits<float>::infinity());
 +}
 +
-+// 原始 BF16 张量入口，不经过 FP8 反量化或 INT8 权重量化。
++// Raw BF16 tensor entry point without FP8 dequantization or INT8 weight quantization.
 +at::Tensor fused_experts_bf16_cpu(
 +    at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
 +    at::Tensor& topk_weights, at::Tensor& topk_ids, double swiglu_limit,
@@ -443,7 +443,7 @@ index 330e6d8..d6e4b5c 100644
                  xft::Logger::error(
                      "[cpu_expertd_w%d] FORWARD_EXPERTS unknown layer=%d "
 diff --git a/ext/cpu_offload_remote_moe.py b/ext/cpu_offload_remote_moe.py
-index 10b02d5..0e104a8 100644
+index 10b02d5..668dd03 100644
 --- a/ext/cpu_offload_remote_moe.py
 +++ b/ext/cpu_offload_remote_moe.py
 @@ -171,6 +171,12 @@ class RemoteMOE:
@@ -451,7 +451,7 @@ index 10b02d5..0e104a8 100644
      # set_weights: build weight SHM file, send LOAD_WEIGHTS, wait ack.
      # ------------------------------------------------------------------ #
 +    def set_bf16_weights(self, gate_up, down, swiglu_limit):
-+        """上传原始 BF16 张量；需要支持操作码 4 的配套守护进程。"""
++        """Upload raw BF16 tensors; requires a matching daemon supporting opcode 4."""
 +        from bf16_weight_protocol import upload
 +
 +        upload(self, gate_up, down, swiglu_limit)
@@ -460,19 +460,19 @@ index 10b02d5..0e104a8 100644
          self,
          w13_ptr: int,
 diff --git a/ext/cpu_offload_slot.h b/ext/cpu_offload_slot.h
-index c5a2032..b7311f9 100644
+index c5a2032..4bab844 100644
 --- a/ext/cpu_offload_slot.h
 +++ b/ext/cpu_offload_slot.h
 @@ -68,6 +68,7 @@ enum class SlotStatus : uint32_t {
  // Wire opcodes. Daemon worker dispatches on req_opcode.
  enum class SlotOpcode : uint32_t {
      NOOP = 0,             // Phase 3.1 ack-only; used for liveness/latency tests
-+    LOAD_BF16_WEIGHTS = 4, // 原始 BF16 v2；旧服务明确拒绝未知操作码
++    LOAD_BF16_WEIGHTS = 4, // Raw BF16 v2; older daemons reject this unknown opcode.
      LOAD_WEIGHTS = 1,     // Bind weights for a layer (see params layout below)
      FORWARD_EXPERTS = 2,  // Run MoE forwardExperts on slot payload buffers
      PREFETCH_EXPERT = 3,  // v5+: fire-and-forget cache-warm request on the
 diff --git a/ext/engine_bindings.cpp b/ext/engine_bindings.cpp
-index ef13ddd..134d4a4 100644
+index ef13ddd..f44c600 100644
 --- a/ext/engine_bindings.cpp
 +++ b/ext/engine_bindings.cpp
 @@ -82,6 +82,10 @@ at::Tensor fused_experts_cpu(
@@ -502,7 +502,7 @@ index ef13ddd..134d4a4 100644
 +          py::arg("hidden_states"), py::arg("w1"), py::arg("w2"),
 +          py::arg("topk_weights"), py::arg("topk_ids"), py::arg("swiglu_limit"),
 +          py::arg("is_vnni") = false, py::call_guard<py::gil_scoped_release>(),
-+          "原始 BF16 专家计算，支持 Hy4 的 SwiGLU 限幅");
++          "Raw BF16 expert computation with Hy4 SwiGLU clipping");
 
      // topk
      m.def("grouped_topk_cpu", &grouped_topk_cpu, "Grouped TopK for CPU");
@@ -567,14 +567,14 @@ index 56ff537..0fdb44d 100644
      moe_time::phase_start();
 
 diff --git a/ext/moe.h b/ext/moe.h
-index 8470a9e..823101f 100644
+index 8470a9e..4203eef 100644
 --- a/ext/moe.h
 +++ b/ext/moe.h
 @@ -12,6 +12,9 @@
  #endif
 
  struct MOEConfig {
-+    // 原始 BF16 上传与旧 FP8 转换路径显式区分。
++    // Distinguish raw BF16 uploads from the existing FP8 conversion path.
 +    bool raw_bf16 = false;
 +    double swiglu_limit = std::numeric_limits<double>::infinity();
      int layer_id;
@@ -585,7 +585,7 @@ index 8470a9e..823101f 100644
      }
      size_t getGateUpSize() const {
 -        return (size_t)config.expert_num * config.hidden_size * config.intermediate_size * 2;  // 2 means gate and up
-+        return (size_t)config.expert_num * config.hidden_size * config.intermediate_size * 2 * (config.raw_bf16 ? 2 : 1);  // gate、up 与元素字节数
++        return (size_t)config.expert_num * config.hidden_size * config.intermediate_size * 2 * (config.raw_bf16 ? 2 : 1);  // gate and up projections, including bytes per element
      }
      size_t getDownSize() const {
 -        return (size_t)config.expert_num * config.hidden_size * config.intermediate_size;
@@ -622,11 +622,11 @@ index c8216d1..82060ea 100644
              'moe_cpu_engine',
 diff --git a/tests/test_bf16_daemon.py b/tests/test_bf16_daemon.py
 new file mode 100644
-index 0000000..ed9b3f1
+index 0000000..ef0d5ff
 --- /dev/null
 +++ b/tests/test_bf16_daemon.py
 @@ -0,0 +1,136 @@
-+"""连接专用守护进程，验证限幅、错误拒绝和旧 FP8 入口；不启动服务。"""
++"""Connect to a dedicated daemon to test clamping, rejection, and the legacy FP8 entry point."""
 +
 +import ctypes
 +import os
@@ -764,11 +764,11 @@ index 0000000..ed9b3f1
 +    unittest.main()
 diff --git a/tests/test_bf16_experts.py b/tests/test_bf16_experts.py
 new file mode 100644
-index 0000000..fbda4e3
+index 0000000..fe5ae04
 --- /dev/null
 +++ b/tests/test_bf16_experts.py
 @@ -0,0 +1,102 @@
-+"""原始 BF16 专家入口：限幅语义、路由加权以及旧入口兼容性。"""
++"""Test raw BF16 expert clamping, routing weights, and compatibility with the existing entry point."""
 +
 +import unittest
 +
@@ -779,7 +779,7 @@ index 0000000..fbda4e3
 +
 +
 +def reference(hidden, w1, w2, weights, ids, limit):
-+    """独立按专家计算；投影在 FP32 累加，激活和第二次投影按 BF16 落盘。"""
++    """Compute each expert independently with FP32 accumulation and BF16 activation and output storage."""
 +    result = torch.zeros_like(hidden, dtype=torch.float32)
 +    for expert in range(w1.shape[0]):
 +        rows, slots = torch.where(ids == expert)
@@ -800,7 +800,7 @@ index 0000000..fbda4e3
 +    def test_clamp_direction_and_both_compute_paths(self):
 +        size = 128
 +        eye = torch.eye(size, dtype=torch.bfloat16)
-+        # gate=输入，up=-输入，可区分 gate 仅截上界与错误的双向截断。
++        # Set gate=input and up=-input to distinguish upper-only gate clipping from symmetric clipping.
 +        w1 = torch.cat([eye, -eye]).unsqueeze(0)
 +        w2 = eye.unsqueeze(0)
 +        for tokens in (1, 32):
@@ -872,11 +872,11 @@ index 0000000..fbda4e3
 +    unittest.main()
 diff --git a/tests/test_bf16_weight_protocol.py b/tests/test_bf16_weight_protocol.py
 new file mode 100644
-index 0000000..0cdf1c6
+index 0000000..c70818e
 --- /dev/null
 +++ b/tests/test_bf16_weight_protocol.py
 @@ -0,0 +1,104 @@
-+"""验证 BF16 上传的文件布局和错误应答，不依赖本机原生扩展。"""
++"""Test BF16 upload layout and error acknowledgments without a local native extension."""
 +
 +import importlib.util
 +from pathlib import Path
