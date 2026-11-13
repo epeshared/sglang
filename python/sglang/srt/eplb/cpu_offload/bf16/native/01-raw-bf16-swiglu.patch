@@ -1,3 +1,168 @@
+diff --git a/ext/bf16_weight_loader.h b/ext/bf16_weight_loader.h
+new file mode 100644
+index 0000000..9343543
+--- /dev/null
++++ b/ext/bf16_weight_loader.h
+@@ -0,0 +1,60 @@
++// 由 cpu_expertd.cpp 引入；复用正式槽位，独立验证原始 BF16 权重协议。
++static std::shared_ptr<LayerSlot> load_bf16_layer(cpu_offload::SlotHandle& slot) {
++    auto* p = slot.hdr->req_params;
++    const int layer = (int32_t)p[0], e = (int32_t)p[1], k = (int32_t)p[2];
++    const int h = (int32_t)p[3], i = (int32_t)p[4];
++    TORCH_CHECK(layer >= 0 && e > 0 && e <= 65536 && k > 0 && k <= e &&
++                h > 0 && h <= 65536 && i > 0 && i <= 65536 && h % 32 == 0 && i % 32 == 0,
++                "BF16 层尺寸非法");
++    TORCH_CHECK(p[6] == (uint64_t(1) << 32), "BF16 仅支持 TP=1、rank=0");
++    uint32_t bits = (uint32_t)p[7];
++    TORCH_CHECK(p[5] == 0 && p[7] == bits, "BF16 请求保留字段非法");
++    float limit;
++    std::memcpy(&limit, &bits, sizeof(limit));
++    TORCH_CHECK(std::isfinite(limit) && limit > 0, "BF16 限幅必须为有限正数");
++    std::lock_guard<std::mutex> lk(g_layers_mu);
++    std::lock_guard<std::mutex> build_lk(g_build_mu);
++    TORCH_CHECK(!g_layers.count(layer) && !g_build_pending.count(layer),
++                "BF16 层编号已占用，禁止复用不明权重");
++    const std::string path = slot.path + ".layer" + std::to_string(layer) + ".weights";
++    int fd = ::open(path.c_str(), O_RDONLY);
++    TORCH_CHECK(fd >= 0, "无法打开 BF16 权重文件");
++    void* base = MAP_FAILED;
++    size_t bytes = 0;
++    try {
++        struct stat st;
++        TORCH_CHECK(::fstat(fd, &st) == 0 && st.st_size >= (off_t)sizeof(WeightFileHeader),
++                    "BF16 权重文件过短");
++        bytes = st.st_size;
++        base = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, fd, 0);
++        TORCH_CHECK(base != MAP_FAILED, "BF16 权重映射失败");
++        auto* w = (WeightFileHeader*)base;
++        const uint64_t down = uint64_t(e) * h * i * 2;
++        TORCH_CHECK(w->magic == WEIGHT_MAGIC && w->version == 2 &&
++                    w->layer_id == layer && w->expert_num == e &&
++                    w->num_experts_per_tok == k && w->hidden_size == h &&
++                    w->intermediate_size == i && w->norm_topk_prob == 0 &&
++                    w->n_group == 1 && w->topk_group == 1 && w->tp_size == 1 && w->tp_rank == 0 &&
++                    (uint32_t)w->pad0 == bits && w->payload_offset == 4096 &&
++                    w->gate_up_size == down * 2 && w->down_size == down &&
++                    w->gate_up_scale_size == 0 && w->down_scale_size == 0 &&
++                    w->gating_bias_size == 0 && bytes == 4096 + down * 3,
++                    "BF16 权重格式、请求或文件长度不匹配");
++        MOEConfig cfg(layer, e, k, h, i, false, 1, 1);
++        cfg.raw_bf16 = true;
++        cfg.swiglu_limit = limit;
++        auto moe = std::make_unique<MOE>(cfg);
++        moe->setWeights((intptr_t)((char*)base + 4096),
++                        (intptr_t)((char*)base + 4096 + down * 2), 0, 0, 0, 1, 0);
++        auto state = std::make_shared<LayerSlot>();
++        state->moe = moe.release();
++        g_layers.emplace(layer, state);
++        ::munmap(base, bytes);
++        ::close(fd);
++        return state;
++    } catch (...) {
++        if (base != MAP_FAILED) ::munmap(base, bytes);
++        ::close(fd);
++        throw;
++    }
++}
+diff --git a/ext/bf16_weight_protocol.py b/ext/bf16_weight_protocol.py
+new file mode 100644
+index 0000000..44cab95
+--- /dev/null
++++ b/ext/bf16_weight_protocol.py
+@@ -0,0 +1,93 @@
++"""经既有共享内存槽位上传原始 BF16；操作码 4 与权重协议 v2 配套。"""
++
++import ctypes
++import math
++import mmap
++import os
++import struct
++
++import torch
++
++
++def upload(remote, gate_up, down, swiglu_limit):
++    """仅接收有形状和精度信息的张量，防止指针大小误判导致越界读取。"""
++    from cpu_offload_remote_moe import _engine, _WEIGHT_HDR_FMT, _WEIGHT_MAGIC
++
++    if "error_code" not in _engine.cpu_client_slot_info(remote._handle):
++        raise RuntimeError("客户端扩展版本过旧，无法检查守护进程错误码")
++    cfg = remote._cfg
++    e, h, i = cfg.expert_num, cfg.hidden_size, cfg.intermediate_size
++    if min(e, h, i) <= 0 or max(e, h, i) > 65536 or h % 32 or i % 32:
++        raise ValueError("BF16 层尺寸非法")
++    if not 0 < cfg.num_experts_per_tok <= e or cfg.layer_id < 0:
++        raise ValueError("BF16 层编号或 top-k 非法")
++    for tensor, shape in ((gate_up, (e, 2 * i, h)), (down, (e, h, i))):
++        if (
++            tensor.device.type != "cpu"
++            or tensor.dtype != torch.bfloat16
++            or not tensor.is_contiguous()
++            or tuple(tensor.shape) != shape
++        ):
++            raise ValueError("必须提供形状匹配的连续 CPU BF16 权重")
++    bits = struct.unpack("<I", struct.pack("<f", swiglu_limit))[0]
++    limit = struct.unpack("<f", struct.pack("<I", bits))[0]
++    if not math.isfinite(limit) or limit <= 0:
++        raise ValueError("BF16 限幅必须为有限正数")
++    if remote._weights_loaded:
++        raise RuntimeError("此客户端已经加载权重")
++    sizes = [gate_up.numel() * 2, down.numel() * 2]
++    total = 4096 + sum(sizes)
++    path = (
++        f"{remote._shm_prefix}.socket{remote._socket_id}"
++        f".slot{remote._slot_id}.layer{cfg.layer_id}.weights"
++    )
++    space = os.statvfs(os.path.dirname(path))
++    if total > space.f_bavail * space.f_frsize:
++        raise RuntimeError("共享内存剩余空间不足以传输 BF16 权重")
++    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
++    try:
++        os.ftruncate(fd, total)
++        with mmap.mmap(fd, total) as mm:
++            header = struct.pack(
++                _WEIGHT_HDR_FMT,
++                _WEIGHT_MAGIC,
++                2,
++                cfg.layer_id,
++                e,
++                cfg.num_experts_per_tok,
++                h,
++                i,
++                0,
++                1,
++                1,
++                1,
++                0,
++                bits,
++                *sizes,
++                0,
++                0,
++                0,
++                4096,
++            )
++            mm[: len(header)] = header
++            address = ctypes.addressof(ctypes.c_char.from_buffer(mm))
++            offset = 4096
++            for tensor, size in zip((gate_up, down), sizes):
++                ctypes.memmove(address + offset, tensor.data_ptr(), size)
++                offset += size
++            mm.flush()
++        params = [cfg.layer_id, e, cfg.num_experts_per_tok, h, i, 0, 1 << 32, bits]
++        seq = _engine.cpu_client_send_request(
++            handle=remote._handle, opcode=4, params=params
++        )
++        result = _engine.cpu_client_wait_completion(
++            handle=remote._handle, expected_seq=seq, timeout_us=120_000_000
++        )
++        info = _engine.cpu_client_slot_info(remote._handle)
++        if result < 0 or info["error_code"] != 0 or info["done_seq"] != seq:
++            raise RuntimeError("BF16 权重加载失败：检查守护进程版本、层编号及协议")
++        remote._weights_loaded = True
++    finally:
++        os.close(fd)
++        # v2 在应答前已经完成打包，服务端不再持有原始映射。
++        os.unlink(path)
 diff --git a/ext/cpu/moe.cpp b/ext/cpu/moe.cpp
 index 7b9a954..023dc5a 100644
 --- a/ext/cpu/moe.cpp
@@ -209,8 +374,105 @@ index 7b9a954..023dc5a 100644
  // shared expert kernel
  //
  // hidden_states: [M, K]
+diff --git a/ext/cpu_expertd.cpp b/ext/cpu_expertd.cpp
+index 330e6d8..d6e4b5c 100644
+--- a/ext/cpu_expertd.cpp
++++ b/ext/cpu_expertd.cpp
+@@ -33,6 +33,7 @@
+ #include <fstream>
+ #include <condition_variable>
+ #include <memory>
++#include <cmath>
+ #include <mutex>
+ #include <limits>
+ #include <pthread.h>
+@@ -235,6 +236,8 @@ inline constexpr uint32_t WEIGHT_MAGIC = 0x57454947u;  // 'WEIG'
+ // g_build_queue sequentially.  Runs in a dedicated thread so that the
+ // ~3s new MOE() + setWeights() (AMX repacking) does not stall the
+ // worker threads that service FORWARD_EXPERTS.
++#include "bf16_weight_loader.h"
++
+ void run_build_loop() {
+     xft::Logger::info("[cpu_expertd_build] async build thread started");
+     while (true) {
+@@ -785,7 +788,26 @@ void run_worker_loop(int worker_idx,
+             // No work; latency probe.
+             break;
+         }
++        case cpu_offload::SlotOpcode::LOAD_BF16_WEIGHTS: {
++            try {
++                auto loaded = load_bf16_layer(slot);
++                layer_view[(int32_t)hdr->req_params[0]] = loaded.get();
++                g_layers_cv.notify_all();
++            } catch (const std::exception& e) {
++                fprintf(stderr, "[BF16 LOAD] %s\n", e.what());
++                err = -40;
++            }
++            break;
++        }
+         case cpu_offload::SlotOpcode::LOAD_WEIGHTS: {
++            {
++                std::lock_guard<std::mutex> guard(g_layers_mu);
++                auto existing = g_layers.find((int32_t)hdr->req_params[0]);
++                if (existing != g_layers.end() && existing->second->moe->getConfig().raw_bf16) {
++                    err = -40;
++                    break;
++                }
++            }
+             int32_t layer_id = (int32_t)hdr->req_params[0];
+             int32_t expert_num = (int32_t)hdr->req_params[1];
+             int32_t num_exp_per_tok = (int32_t)hdr->req_params[2];
+@@ -926,7 +948,7 @@ void run_worker_loop(int worker_idx,
+                 break;
+             }
+             auto* wh = (WeightFileHeader*)wbase;
+-            if (wh->magic != WEIGHT_MAGIC) {
++            if (wh->magic != WEIGHT_MAGIC || wh->version != 1) {
+                 xft::Logger::error(
+                     "[cpu_expertd_w%d] LOAD_WEIGHTS bad magic 0x%08x",
+                     worker_idx, wh->magic);
+@@ -1055,6 +1077,10 @@ void run_worker_loop(int worker_idx,
+                     layer_view[layer_id] = ls;
+                 }
+             }
++            if (ls && ls->moe->getConfig().raw_bf16 && in_is_int8) {
++                err = -40;
++                break;
++            }
+             if (ls == nullptr) {
+                 xft::Logger::error(
+                     "[cpu_expertd_w%d] FORWARD_EXPERTS unknown layer=%d "
+diff --git a/ext/cpu_offload_remote_moe.py b/ext/cpu_offload_remote_moe.py
+index 10b02d5..0e104a8 100644
+--- a/ext/cpu_offload_remote_moe.py
++++ b/ext/cpu_offload_remote_moe.py
+@@ -171,6 +171,12 @@ class RemoteMOE:
+     # ------------------------------------------------------------------ #
+     # set_weights: build weight SHM file, send LOAD_WEIGHTS, wait ack.
+     # ------------------------------------------------------------------ #
++    def set_bf16_weights(self, gate_up, down, swiglu_limit):
++        """上传原始 BF16 张量；需要支持操作码 4 的配套守护进程。"""
++        from bf16_weight_protocol import upload
++
++        upload(self, gate_up, down, swiglu_limit)
++
+     def set_weights(
+         self,
+         w13_ptr: int,
+diff --git a/ext/cpu_offload_slot.h b/ext/cpu_offload_slot.h
+index c5a2032..b7311f9 100644
+--- a/ext/cpu_offload_slot.h
++++ b/ext/cpu_offload_slot.h
+@@ -68,6 +68,7 @@ enum class SlotStatus : uint32_t {
+ // Wire opcodes. Daemon worker dispatches on req_opcode.
+ enum class SlotOpcode : uint32_t {
+     NOOP = 0,             // Phase 3.1 ack-only; used for liveness/latency tests
++    LOAD_BF16_WEIGHTS = 4, // 原始 BF16 v2；旧服务明确拒绝未知操作码
+     LOAD_WEIGHTS = 1,     // Bind weights for a layer (see params layout below)
+     FORWARD_EXPERTS = 2,  // Run MoE forwardExperts on slot payload buffers
+     PREFETCH_EXPERT = 3,  // v5+: fire-and-forget cache-warm request on the
 diff --git a/ext/engine_bindings.cpp b/ext/engine_bindings.cpp
-index ef13ddd..2561bd5 100644
+index ef13ddd..134d4a4 100644
 --- a/ext/engine_bindings.cpp
 +++ b/ext/engine_bindings.cpp
 @@ -82,6 +82,10 @@ at::Tensor fused_experts_cpu(
@@ -224,7 +486,15 @@ index ef13ddd..2561bd5 100644
  // TODO: this is only for UT test
  // topk
  std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
-@@ -1090,6 +1094,11 @@ PYBIND11_MODULE(moe_cpu_engine, m) {
+@@ -962,6 +966,7 @@ PYBIND11_MODULE(moe_cpu_engine, m) {
+               d["req_seq"] = (uint64_t)hdr->req_seq.load();
+               d["done_seq"] = (uint64_t)hdr->done_seq.load();
+               d["last_compute_ns"] = (uint64_t)hdr->last_compute_ns;
++              d["error_code"] = (int32_t)hdr->error_code;
+               // Daemon-side statistics (real counts including CUDA graph replays).
+               // v3+: fwd_count / fwd_tokens / fwd_active_toks / compute_ns_sum
+               // v4+: fwd_cpu_pairs (actual per-pair CPU work count)
+@@ -1090,6 +1095,11 @@ PYBIND11_MODULE(moe_cpu_engine, m) {
 
      // moe
      m.def("fused_experts_cpu", &fused_experts_cpu, "fused moe kernel for CPU");
@@ -236,6 +506,262 @@ index ef13ddd..2561bd5 100644
 
      // topk
      m.def("grouped_topk_cpu", &grouped_topk_cpu, "Grouped TopK for CPU");
+diff --git a/ext/moe.cpp b/ext/moe.cpp
+index 56ff537..0fdb44d 100644
+--- a/ext/moe.cpp
++++ b/ext/moe.cpp
+@@ -32,6 +32,10 @@ enum MOE_DType {
+
+ at::Tensor convert_weight_packed(at::Tensor& weight);
+
++at::Tensor fused_experts_bf16_cpu(
++    at::Tensor& hidden, at::Tensor& w1, at::Tensor& w2,
++    at::Tensor& weights, at::Tensor& ids, double limit, bool packed);
++
+ at::Tensor fused_experts_cpu(
+     at::Tensor& hidden_states,
+     at::Tensor& w1,
+@@ -250,6 +254,10 @@ dequantize_fp8_to_int8_per_channel_fused(
+ }
+
+ MOE::MOE(const MOEConfig& cfg) : config(cfg) {
++    if (config.raw_bf16) {
++        TORCH_CHECK(!EngineConfig::getInstance().numaEnabled(), "原始 BF16 仅支持独立守护进程");
++        return;
++    }
+     // Broadcast to all NUMA nodes to initialize the MOE
+     // This is only done by the master node (rank 0), slave nodes receive it in task dispatch thread
+     EngineConfig& engineCfg = EngineConfig::getInstance();
+@@ -268,6 +276,17 @@ MOE::MOE(const MOEConfig& cfg) : config(cfg) {
+
+ void MOE::setWeights(intptr_t gateUpWeights, intptr_t downWeights, intptr_t gateUpScales, intptr_t downScales,
+         intptr_t gatingCorrBias = 0, int tpSize = -1, int tpRank = -1) {
++    if (config.raw_bf16) {
++        TORCH_CHECK(tpSize == 1 && tpRank == 0, "原始 BF16 暂不支持张量切片");
++        TORCH_CHECK(gateUpWeights && downWeights, "BF16 权重指针不能为空");
++        auto w1 = at::from_blob((void*)gateUpWeights,
++            {config.expert_num, 2 * config.intermediate_size, config.hidden_size}, at::kBFloat16);
++        auto w2 = at::from_blob((void*)downWeights,
++            {config.expert_num, config.hidden_size, config.intermediate_size}, at::kBFloat16);
++        packed_w1 = convert_weight_packed(w1);
++        packed_w2 = convert_weight_packed(w2);
++        return;
++    }
+     // Broadcast to all NUMA nodes to set weights
+     EngineConfig& engineCfg = EngineConfig::getInstance();
+     if (engineCfg.numaEnabled()) {
+@@ -958,6 +977,15 @@ static bool directOutEnabled() {
+ }
+
+ void MOE::forwardExperts(void *input, int *topkIds, float *topkWeights, void *output, int n_tokens = 1) {
++    if (config.raw_bf16) {
++        auto h = at::from_blob(input, {n_tokens, config.hidden_size}, at::kBFloat16);
++        auto ids = at::from_blob(topkIds, {n_tokens, config.num_experts_per_tok}, at::kInt);
++        auto weights = at::from_blob(topkWeights, {n_tokens, config.num_experts_per_tok}, at::kFloat);
++        auto result = fused_experts_bf16_cpu(h, packed_w1, packed_w2, weights, ids,
++                                            config.swiglu_limit, true);
++        std::memcpy(output, result.data_ptr(), getOutputSize(n_tokens));
++        return;
++    }
+     // avg_gemm_us times this whole call, so the phase stopwatch starts here.
+     moe_time::phase_start();
+
+diff --git a/ext/moe.h b/ext/moe.h
+index 8470a9e..823101f 100644
+--- a/ext/moe.h
++++ b/ext/moe.h
+@@ -12,6 +12,9 @@
+ #endif
+
+ struct MOEConfig {
++    // 原始 BF16 上传与旧 FP8 转换路径显式区分。
++    bool raw_bf16 = false;
++    double swiglu_limit = std::numeric_limits<double>::infinity();
+     int layer_id;
+     int expert_num;  // routed expert num
+     int num_experts_per_tok;  // num experts per token
+@@ -57,21 +60,23 @@ class MOE {
+         return ntokens * config.hidden_size * sizeof(bfloat16_t);
+     }
+     size_t getGateUpSize() const {
+-        return (size_t)config.expert_num * config.hidden_size * config.intermediate_size * 2;  // 2 means gate and up
++        return (size_t)config.expert_num * config.hidden_size * config.intermediate_size * 2 * (config.raw_bf16 ? 2 : 1);  // gate、up 与元素字节数
+     }
+     size_t getDownSize() const {
+-        return (size_t)config.expert_num * config.hidden_size * config.intermediate_size;
++        return (size_t)config.expert_num * config.hidden_size * config.intermediate_size * (config.raw_bf16 ? 2 : 1);
+     }
+     size_t getGateUpScaleSize() const {
++        if (config.raw_bf16) return 0;
+         return (size_t)config.expert_num * ((config.hidden_size + 127) / 128) *
+                ((config.intermediate_size + 127) / 128) * 2 * sizeof(float);
+     }
+     size_t getDownScaleSize() const {
++        if (config.raw_bf16) return 0;
+         return (size_t)config.expert_num * ((config.hidden_size + 127) / 128) *
+                ((config.intermediate_size + 127) / 128) * sizeof(float);
+     }
+     size_t getGatingBiasSize() const {
+-        return config.expert_num * sizeof(float);
++        return config.raw_bf16 ? 0 : config.expert_num * sizeof(float);
+     }
+
+     void setWeights(intptr_t gateUpWeights, intptr_t downWeights, intptr_t gateUpScales,
+diff --git a/ext/setup.py b/ext/setup.py
+index c8216d1..82060ea 100644
+--- a/ext/setup.py
++++ b/ext/setup.py
+@@ -292,7 +292,7 @@ setup(
+     name='moe_cpu_engine',
+     version='0.1',
+     py_modules=['moe_offload_config', 'cpu_expertd_main',
+-                'cpu_offload_remote_moe', 'prepare_full_expert_weights'],
++                'cpu_offload_remote_moe', 'bf16_weight_protocol', 'prepare_full_expert_weights'],
+     ext_modules=[
+         cpp_extension.CUDAExtension(
+             'moe_cpu_engine',
+diff --git a/tests/test_bf16_daemon.py b/tests/test_bf16_daemon.py
+new file mode 100644
+index 0000000..ed9b3f1
+--- /dev/null
++++ b/tests/test_bf16_daemon.py
+@@ -0,0 +1,136 @@
++"""连接专用守护进程，验证限幅、错误拒绝和旧 FP8 入口；不启动服务。"""
++
++import ctypes
++import os
++from pathlib import Path
++import struct
++import unittest
++
++import torch
++import moe_cpu_engine as engine
++from cpu_offload_remote_moe import RemoteMOE, _WEIGHT_HDR_FMT, _WEIGHT_MAGIC
++
++
++class DaemonTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.prefix = os.environ["HY4_TEST_SHM_PREFIX"]
++        cls.handle = engine.cpu_client_open_slot(cls.prefix, 0, 0, 10000)
++        if not cls.handle:
++            raise RuntimeError("测试守护进程不可达")
++        torch.set_num_threads(4)
++
++    @classmethod
++    def tearDownClass(cls):
++        engine.cpu_client_close_slot(cls.handle)
++
++    def remote(self, layer):
++        return RemoteMOE(
++            self.handle,
++            layer,
++            2,
++            1,
++            128,
++            128,
++            norm_topk_prob=False,
++            shm_prefix=self.prefix,
++        )
++
++    def forward(self, remote, hidden):
++        ids = torch.zeros(len(hidden), 1, dtype=torch.int32)
++        routing = torch.ones(len(hidden), 1)
++        output = torch.full_like(hidden, float("nan"))
++        before = engine.cpu_client_slot_info(self.handle)
++        fn, arg = remote.forward_experts(
++            hidden.data_ptr(),
++            ids.data_ptr(),
++            routing.data_ptr(),
++            output.data_ptr(),
++            len(hidden),
++        )
++        ctypes.CFUNCTYPE(None, ctypes.c_void_p)(fn)(arg)
++        after = engine.cpu_client_slot_info(self.handle)
++        self.assertEqual(after["error_code"], 0)
++        self.assertEqual(after["req_seq"], after["done_seq"])
++        self.assertEqual(after["stat_fwd_count"], before["stat_fwd_count"] + 1)
++        return output
++
++    def test_raw_clamp_and_duplicate_rejected(self):
++        eye = torch.eye(128, dtype=torch.bfloat16)
++        gate = torch.cat((eye, -eye)).repeat(2, 1, 1)
++        down = eye.repeat(2, 1, 1)
++        remote = self.remote(101)
++        remote.set_bf16_weights(gate, down, 10.0)
++        for tokens in (1, 32):
++            hidden = torch.tensor(
++                [-20.0, -2.0, 2.0, 20.0], dtype=torch.bfloat16
++            ).repeat(tokens, 32)
++            actual = self.forward(remote, hidden)
++            expected = (
++                torch.nn.functional.silu(hidden.float().clamp(max=10))
++                * (-hidden.float()).clamp(-10, 10)
++            ).to(torch.bfloat16)
++            torch.testing.assert_close(actual, expected, rtol=0.008, atol=1e-7)
++        with self.assertRaisesRegex(RuntimeError, "加载失败"):
++            self.remote(101).set_bf16_weights(gate, down, 10.0)
++
++    def test_invalid_file_rejected(self):
++        path = Path(self.prefix + ".socket0.slot0.layer102.weights")
++        bits = struct.unpack("<I", struct.pack("<f", 10.0))[0]
++        header = struct.pack(
++            _WEIGHT_HDR_FMT,
++            _WEIGHT_MAGIC,
++            2,
++            102,
++            2,
++            1,
++            128,
++            128,
++            0,
++            1,
++            1,
++            1,
++            0,
++            bits,
++            131072,
++            65536,
++            0,
++            0,
++            0,
++            4096,
++        )
++        good = header + bytes(4096 + 131072 + 65536 - len(header))
++        wrong_version = bytearray(good)
++        struct.pack_into("<I", wrong_version, 4, 1)
++        wrong_limit = bytearray(good)
++        struct.pack_into("<f", wrong_limit, 48, 1.0)
++        try:
++            for data in (good[:4096], wrong_version, wrong_limit):
++                with self.subTest(bytes=len(data)):
++                    path.write_bytes(data)
++                    seq = engine.cpu_client_send_request(
++                        self.handle, 4, [102, 2, 1, 128, 128, 0, 1 << 32, bits]
++                    )
++                    self.assertGreaterEqual(
++                        engine.cpu_client_wait_completion(self.handle, seq, 10000000), 0
++                    )
++                    self.assertEqual(
++                        engine.cpu_client_slot_info(self.handle)["error_code"], -40
++                    )
++        finally:
++            path.unlink()
++
++    def test_legacy_fp8_entry(self):
++        remote = self.remote(103)
++        gate = torch.zeros(2, 256, 128, dtype=torch.float8_e4m3fn)
++        down = torch.zeros(2, 128, 128, dtype=torch.float8_e4m3fn)
++        gs, ds = torch.ones(2, 2, 1), torch.ones(2, 1, 1)
++        remote.set_weights(
++            gate.data_ptr(), down.data_ptr(), gs.data_ptr(), ds.data_ptr(), 0, 1, 0
++        )
++        output = self.forward(remote, torch.ones(32, 128, dtype=torch.bfloat16))
++        self.assertTrue(torch.equal(output, torch.zeros_like(output)))
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/tests/test_bf16_experts.py b/tests/test_bf16_experts.py
 new file mode 100644
 index 0000000..fbda4e3
@@ -340,6 +866,116 @@ index 0000000..fbda4e3
 +            torch.empty(0, 1), torch.empty(0, 1, dtype=torch.int32), 10.,
 +        )
 +        self.assertEqual(tuple(output.shape), (0, 128))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_bf16_weight_protocol.py b/tests/test_bf16_weight_protocol.py
+new file mode 100644
+index 0000000..0cdf1c6
+--- /dev/null
++++ b/tests/test_bf16_weight_protocol.py
+@@ -0,0 +1,104 @@
++"""验证 BF16 上传的文件布局和错误应答，不依赖本机原生扩展。"""
++
++import importlib.util
++from pathlib import Path
++import struct
++import sys
++import tempfile
++from types import SimpleNamespace
++import unittest
++from unittest.mock import patch
++
++import torch
++
++
++spec = importlib.util.spec_from_file_location(
++    "bf16_weight_protocol", Path(__file__).parents[1] / "ext/bf16_weight_protocol.py"
++)
++protocol = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(protocol)
++
++
++class ProtocolTests(unittest.TestCase):
++    def setUp(self):
++        self.directory = tempfile.TemporaryDirectory()
++        self.addCleanup(self.directory.cleanup)
++        self.remote = SimpleNamespace(
++            _cfg=SimpleNamespace(
++                layer_id=2,
++                expert_num=2,
++                hidden_size=32,
++                intermediate_size=32,
++                num_experts_per_tok=1,
++            ),
++            _handle=1,
++            _socket_id=0,
++            _slot_id=0,
++            _weights_loaded=False,
++            _shm_prefix=self.directory.name + "/test",
++        )
++        self.gate = torch.arange(4096).reshape(2, 64, 32).to(torch.bfloat16)
++        self.down = torch.ones(2, 32, 32, dtype=torch.bfloat16)
++        self.error = 0
++        self.sent = 0
++        engine = SimpleNamespace(
++            cpu_client_slot_info=lambda _: {"error_code": self.error, "done_seq": 7},
++            cpu_client_send_request=self.send,
++            cpu_client_wait_completion=lambda **_: 123,
++        )
++        self.fake = SimpleNamespace(
++            _engine=engine,
++            _WEIGHT_MAGIC=0x57454947,
++            _WEIGHT_HDR_FMT="<IIiiiiiiiiiiiQQQQQQ",
++        )
++
++    def send(self, handle, opcode, params):
++        self.sent += 1
++        self.assertEqual(opcode, 4)
++        self.assertEqual(params[7], struct.unpack("<I", struct.pack("<f", 10.0))[0])
++        data = Path(
++            self.remote._shm_prefix + ".socket0.slot0.layer2.weights"
++        ).read_bytes()
++        header = struct.unpack_from(self.fake._WEIGHT_HDR_FMT, data)
++        self.assertEqual(header[:4], (0x57454947, 2, 2, 2))
++        self.assertEqual(header[-6:], (8192, 4096, 0, 0, 0, 4096))
++        self.assertEqual(len(data), 16384)
++        self.assertEqual(
++            data[4096:12288], self.gate.view(torch.uint8).numpy().tobytes()
++        )
++        return 7
++
++    def upload(self, gate=None, limit=10.0):
++        with patch.dict(sys.modules, {"cpu_offload_remote_moe": self.fake}):
++            protocol.upload(
++                self.remote, self.gate if gate is None else gate, self.down, limit
++            )
++
++    def test_wire_layout_and_source_released(self):
++        self.upload()
++        self.assertTrue(self.remote._weights_loaded)
++        self.assertFalse(list(Path(self.directory.name).iterdir()))
++
++    def test_daemon_error_is_not_success(self):
++        self.error = -40
++        with self.assertRaisesRegex(RuntimeError, "加载失败"):
++            self.upload()
++        self.assertFalse(self.remote._weights_loaded)
++        self.assertFalse(list(Path(self.directory.name).iterdir()))
++
++    def test_bad_tensor_rejected_before_write(self):
++        for value in (self.gate.float(), self.gate.transpose(1, 2), self.gate[:1]):
++            with self.subTest(shape=value.shape):
++                with self.assertRaises(ValueError):
++                    self.upload(gate=value)
++        self.assertEqual(self.sent, 0)
++
++    def test_bad_limit_rejected_before_write(self):
++        for limit in (-1.0, 0.0, float("inf"), float("nan")):
++            with self.assertRaises(ValueError):
++                self.upload(limit=limit)
++        self.assertEqual(self.sent, 0)
 +
 +
 +if __name__ == "__main__":
