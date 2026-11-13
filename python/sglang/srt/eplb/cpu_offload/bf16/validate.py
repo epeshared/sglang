@@ -1,10 +1,12 @@
 """用真实 Hy4 权重比较 CPU、GPU 和混合专家输出；不代表完整模型验收。"""
 
 import argparse
+import hashlib
 import json
 import platform
 from pathlib import Path
 
+import moe_cpu_engine
 import torch
 
 from .layer import Bf16Experts
@@ -41,6 +43,16 @@ def main():
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(),
         "threads": args.threads,
+        "seed": 20261113,
+        "native_module": moe_cpu_engine.__file__,
+        "native_module_sha256": hashlib.sha256(
+            Path(moe_cpu_engine.__file__).read_bytes()
+        ).hexdigest(),
+        "config_sha256": hashlib.sha256(
+            (Path(args.model_path) / "config.json").read_bytes()
+        ).hexdigest(),
+        "swiglu_limit": config["swiglu_limit"],
+        "routed_scaling_factor": config["routed_scaling_factor"],
         "model_path": args.model_path,
         "layers": args.layers,
         "experts": args.experts,

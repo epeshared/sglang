@@ -22,7 +22,8 @@ def forward(hidden, gate_up, down, topk_ids, topk_weights, limit):
 
 
 def error_metrics(actual, expected):
-    a, b = actual.detach().float().cpu(), expected.detach().float().cpu()
+    # 只在统计时使用双精度，避免大张量的余弦值因归约舍入略大于 1。
+    a, b = actual.detach().double().cpu(), expected.detach().double().cpu()
     return {
         "finite": bool(torch.isfinite(a).all() and torch.isfinite(b).all()),
         "relative_l2": float((a - b).norm() / b.norm().clamp_min(1e-12)),
