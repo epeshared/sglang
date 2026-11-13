@@ -1,0 +1,346 @@
+diff --git a/ext/cpu/moe.cpp b/ext/cpu/moe.cpp
+index 7b9a954..023dc5a 100644
+--- a/ext/cpu/moe.cpp
++++ b/ext/cpu/moe.cpp
+@@ -2,6 +2,8 @@
+ #include "gemm.h"
+ #include "moe_time.h"
+ #include "vec.h"
++#include <cmath>
++#include <limits>
+
+ namespace {
+
+@@ -253,6 +255,15 @@ int moe_align_block_size(
+   return num_tokens_post_pad;
+ }
+
++// Hy4 的 gate 只截上界，up 截到 [-limit, limit]；无限限值保留旧计算路径。
++template <typename Vec>
++inline void clamp_swiglu(Vec& gate, Vec& up, float limit) {
++  if (std::isfinite(limit)) {
++    gate = at::vec::minimum(gate, Vec(limit));
++    up = at::vec::maximum(at::vec::minimum(up, Vec(limit)), Vec(-limit));
++  }
++}
++
+ //   silu :    shape          leading dimension
+ //  input0  [m_size, BLOCK_N]    BLOCK_N
+ //  input1  [m_size, BLOCK_N]    BLOCK_N
+@@ -263,7 +274,8 @@ inline void silu_and_mul(
+     const float* __restrict__ input0,  // x: x0, x1
+     const float* __restrict__ input1,  // y: y0, y1
+     int64_t m_size,
+-    int64_t N) {
++    int64_t N,
++    float swiglu_limit = std::numeric_limits<float>::infinity()) {
+   using bVec = at::vec::Vectorized<scalar_t>;
+   using fVec = at::vec::Vectorized<float>;
+
+@@ -280,6 +292,8 @@ inline void silu_and_mul(
+       fVec x1 = fVec::loadu(x + d + fVec::size());
+       fVec y0 = fVec::loadu(y + d);
+       fVec y1 = fVec::loadu(y + d + fVec::size());
++      clamp_swiglu(x0, y0, swiglu_limit);
++      clamp_swiglu(x1, y1, swiglu_limit);
+       // silu
+       x0 = x0 / (one + x0.neg().exp_u20());
+       x1 = x1 / (one + x1.neg().exp_u20());
+@@ -303,7 +317,8 @@ struct tinygemm_kernel_nn2 {
+       int64_t K,
+       int64_t lda,
+       int64_t ldb,
+-      int64_t ldc) {
++      int64_t ldc,
++      float swiglu_limit) {
+     TORCH_CHECK(false, "tinygemm_kernel_nn: scalar path not implemented!");
+   }
+ };
+@@ -319,7 +334,8 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
+       int64_t K,
+       int64_t lda,
+       int64_t ldb,
+-      int64_t ldc) {
++      int64_t ldc,
++      float swiglu_limit) {
+     constexpr int ROWS = BLOCK_M;
+     constexpr int COLS = BLOCK_N / 16;
+
+@@ -380,6 +396,8 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
+         Vec x1 = vc0[row * COLS + col + 1];
+         Vec y0 = vc1[row * COLS + col + 0];
+         Vec y1 = vc1[row * COLS + col + 1];
++        clamp_swiglu(x0, y0, swiglu_limit);
++        clamp_swiglu(x1, y1, swiglu_limit);
+         // silu
+         x0 = x0 / (one + x0.neg().exp_u20());
+         x1 = x1 / (one + x1.neg().exp_u20());
+@@ -399,7 +417,7 @@ struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
+
+ #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)       \
+   tinygemm_kernel_nn2<scalar_t, MB_SIZE, NB_SIZE>::apply( \
+-      A + mb_start * lda, B0 + nb_start * 2, B1 + nb_start * 2, C + mb_start * ldc + nb_start, K, lda, ldb, ldc);
++      A + mb_start * lda, B0 + nb_start * 2, B1 + nb_start * 2, C + mb_start * ldc + nb_start, K, lda, ldb, ldc, swiglu_limit);
+
+ template <typename scalar_t>
+ void tinygemm_kernel(
+@@ -412,7 +430,8 @@ void tinygemm_kernel(
+     int64_t K,
+     int64_t lda,
+     int64_t ldb,
+-    int64_t ldc) {
++    int64_t ldc,
++    float swiglu_limit = std::numeric_limits<float>::infinity()) {
+   // pattern: 1-(2+2)-(8+8)
+   constexpr int64_t BLOCK_M = 4;
+   constexpr int64_t BLOCK_N = 32;
+@@ -595,7 +614,8 @@ void fused_experts_kernel_impl(
+     int64_t K,
+     int64_t E,
+     int64_t topk,
+-    int64_t num_tokens_post_pad) {
++    int64_t num_tokens_post_pad,
++    float swiglu_limit) {
+   // handle 2 tiles per block
+   constexpr int64_t BLOCK_M = block_size_m();
+   constexpr int64_t BLOCK_N = block_size_n();
+@@ -669,7 +689,7 @@ void fused_experts_kernel_impl(
+
+         // 1.d silu and mul
+         const int64_t offset = offsets[mb];
+-        silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
++        silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N, swiglu_limit);
+       } else {
+         // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
+         const int64_t offset = offsets[mb];
+@@ -683,7 +703,8 @@ void fused_experts_kernel_impl(
+             /* K     */ K,
+             /* lda   */ K,
+             /* ldb   */ n_size,
+-            /* ldc   */ N);
++            /* ldc   */ N,
++            swiglu_limit);
+       }
+     });
+
+@@ -973,7 +994,7 @@ static inline void check_moe_scales(
+ // topk_weights: [M, topk]
+ // topk_ids: [M, topk] (int32_t)
+ //
+-at::Tensor fused_experts_cpu(
++static at::Tensor fused_experts_cpu_impl(
+     at::Tensor& hidden_states,
+     at::Tensor& w1,
+     at::Tensor& w2,
+@@ -987,7 +1008,8 @@ at::Tensor fused_experts_cpu(
+     const std::optional<std::vector<int64_t>> block_size,
+     const std::optional<at::Tensor>& a1_scale,
+     const std::optional<at::Tensor>& a2_scale,
+-    bool is_vnni) {
++    bool is_vnni,
++    float swiglu_limit) {
+   RECORD_FUNCTION(
+       "sgl-kernel::fused_experts_cpu", std::vector<c10::IValue>({hidden_states, w1, w2, topk_weights, topk_ids}));
+
+@@ -1223,7 +1245,8 @@ at::Tensor fused_experts_cpu(
+           K,
+           E,
+           topk,
+-          num_tokens_post_pad);
++          num_tokens_post_pad,
++          swiglu_limit);
+     }
+   });
+
+@@ -1234,6 +1257,56 @@ at::Tensor fused_experts_cpu(
+   return out_hidden_states;
+ }
+
++// 保留原绑定和调用约定，旧 FP8／INT8／不限幅 BF16 路径仍传无限限值。
++at::Tensor fused_experts_cpu(
++    at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
++    at::Tensor& topk_weights, at::Tensor& topk_ids,
++    bool inplace, bool use_int8_w8a8, bool use_fp8_w8a16,
++    const std::optional<at::Tensor>& w1_scale,
++    const std::optional<at::Tensor>& w2_scale,
++    const std::optional<std::vector<int64_t>> block_size,
++    const std::optional<at::Tensor>& a1_scale,
++    const std::optional<at::Tensor>& a2_scale, bool is_vnni) {
++  return fused_experts_cpu_impl(hidden_states, w1, w2, topk_weights, topk_ids,
++      inplace, use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size,
++      a1_scale, a2_scale, is_vnni, std::numeric_limits<float>::infinity());
++}
++
++// 原始 BF16 张量入口，不经过 FP8 反量化或 INT8 权重量化。
++at::Tensor fused_experts_bf16_cpu(
++    at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
++    at::Tensor& topk_weights, at::Tensor& topk_ids, double swiglu_limit,
++    bool is_vnni) {
++  TORCH_CHECK(!std::isnan(swiglu_limit) && swiglu_limit > 0, "SwiGLU 限值必须为正数");
++  for (const auto& tensor : {hidden_states, w1, w2}) {
++    TORCH_CHECK(tensor.device().is_cpu() && tensor.scalar_type() == at::kBFloat16,
++                "原始 BF16 入口要求 CPU BF16 输入和权重");
++    TORCH_CHECK(tensor.is_contiguous(), "原始 BF16 输入和权重必须连续");
++  }
++  TORCH_CHECK(topk_ids.device().is_cpu() && topk_weights.device().is_cpu(),
++              "路由张量必须在 CPU 上");
++  TORCH_CHECK(topk_ids.is_contiguous() && topk_weights.is_contiguous(), "路由张量必须连续");
++  TORCH_CHECK(hidden_states.dim() == 2 && w1.dim() == 3 && w2.dim() == 3 &&
++              topk_ids.dim() == 2 && topk_weights.dim() == 2, "BF16 专家张量维数错误");
++  TORCH_CHECK(topk_ids.scalar_type() == at::kInt, "专家编号必须使用 int32");
++  TORCH_CHECK(topk_ids.sizes() == topk_weights.sizes() &&
++              topk_ids.size(0) == hidden_states.size(0) && topk_ids.size(1) > 0,
++              "路由形状必须与输入 token 数一致");
++  TORCH_CHECK(w1.size(0) > 0 && w2.size(0) == w1.size(0) &&
++              w1.size(1) == 2 * w2.size(2) && w1.size(2) == hidden_states.size(1) &&
++              w2.size(1) == hidden_states.size(1), "BF16 专家权重形状错误");
++  TORCH_CHECK(hidden_states.size(1) > 0 && w2.size(2) > 0 &&
++              hidden_states.size(1) % block_size_n() == 0 && w2.size(2) % block_size_n() == 0,
++              "BF16 专家维度必须是计算分块的整数倍");
++  TORCH_CHECK(topk_ids.numel() == 0 ||
++              ((topk_ids >= -1) & (topk_ids < w1.size(0))).all().item<bool>(),
++              "专家编号必须为 -1 或合法的局部权重下标");
++  if (hidden_states.size(0) == 0) return at::empty_like(hidden_states);
++  return fused_experts_cpu_impl(hidden_states, w1, w2, topk_weights, topk_ids,
++      false, false, false, std::nullopt, std::nullopt, std::nullopt,
++      std::nullopt, std::nullopt, is_vnni, static_cast<float>(swiglu_limit));
++}
++
+ // shared expert kernel
+ //
+ // hidden_states: [M, K]
+diff --git a/ext/engine_bindings.cpp b/ext/engine_bindings.cpp
+index ef13ddd..2561bd5 100644
+--- a/ext/engine_bindings.cpp
++++ b/ext/engine_bindings.cpp
+@@ -82,6 +82,10 @@ at::Tensor fused_experts_cpu(
+     const std::optional<at::Tensor>& a2_scale,
+     bool is_vnni);
+
++at::Tensor fused_experts_bf16_cpu(
++    at::Tensor& hidden_states, at::Tensor& w1, at::Tensor& w2,
++    at::Tensor& topk_weights, at::Tensor& topk_ids, double swiglu_limit, bool is_vnni);
++
+ // TODO: this is only for UT test
+ // topk
+ std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
+@@ -1090,6 +1094,11 @@ PYBIND11_MODULE(moe_cpu_engine, m) {
+
+     // moe
+     m.def("fused_experts_cpu", &fused_experts_cpu, "fused moe kernel for CPU");
++    m.def("fused_experts_bf16_cpu", &fused_experts_bf16_cpu,
++          py::arg("hidden_states"), py::arg("w1"), py::arg("w2"),
++          py::arg("topk_weights"), py::arg("topk_ids"), py::arg("swiglu_limit"),
++          py::arg("is_vnni") = false, py::call_guard<py::gil_scoped_release>(),
++          "原始 BF16 专家计算，支持 Hy4 的 SwiGLU 限幅");
+
+     // topk
+     m.def("grouped_topk_cpu", &grouped_topk_cpu, "Grouped TopK for CPU");
+diff --git a/tests/test_bf16_experts.py b/tests/test_bf16_experts.py
+new file mode 100644
+index 0000000..fbda4e3
+--- /dev/null
++++ b/tests/test_bf16_experts.py
+@@ -0,0 +1,102 @@
++"""原始 BF16 专家入口：限幅语义、路由加权以及旧入口兼容性。"""
++
++import unittest
++
++import torch
++import torch.nn.functional as F
++
++import moe_cpu_engine as engine
++
++
++def reference(hidden, w1, w2, weights, ids, limit):
++    """独立按专家计算；投影在 FP32 累加，激活和第二次投影按 BF16 落盘。"""
++    result = torch.zeros_like(hidden, dtype=torch.float32)
++    for expert in range(w1.shape[0]):
++        rows, slots = torch.where(ids == expert)
++        if rows.numel() == 0:
++            continue
++        gate, up = F.linear(hidden[rows].float(), w1[expert].float()).chunk(2, -1)
++        active = (F.silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)).to(torch.bfloat16)
++        values = F.linear(active.float(), w2[expert].float()).to(torch.bfloat16)
++        result.index_add_(0, rows, values.float() * weights[rows, slots, None])
++    return result.to(torch.bfloat16)
++
++
++class Bf16ExpertsTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        torch.set_num_threads(4)
++
++    def test_clamp_direction_and_both_compute_paths(self):
++        size = 128
++        eye = torch.eye(size, dtype=torch.bfloat16)
++        # gate=输入，up=-输入，可区分 gate 仅截上界与错误的双向截断。
++        w1 = torch.cat([eye, -eye]).unsqueeze(0)
++        w2 = eye.unsqueeze(0)
++        for tokens in (1, 32):
++            for limit in (1.0, 10.0, float("inf")):
++                with self.subTest(tokens=tokens, limit=limit):
++                    hidden = torch.tensor([-20., -10., -2., 2., 10., 20., 0., 0.5], dtype=torch.bfloat16).repeat(tokens, 16)
++                    ids = torch.zeros(tokens, 1, dtype=torch.int32)
++                    weights = torch.ones(tokens, 1)
++                    actual = engine.fused_experts_bf16_cpu(hidden, w1, w2, weights, ids, limit)
++                    expected = reference(hidden, w1, w2, weights, ids, limit)
++                    torch.testing.assert_close(actual, expected, rtol=0.008, atol=1e-7)
++                    if limit == 10:
++                        unlimited = engine.fused_experts_cpu(hidden, w1, w2, weights, ids, False, False, False, None, None, None, None, None, False)
++                        self.assertGreater(float((unlimited - actual).abs().max()), 100)
++
++    def test_multiexpert_weighted_routes_and_padding(self):
++        generator = torch.Generator().manual_seed(47)
++        for tokens in (1, 64):
++            with self.subTest(tokens=tokens):
++                w1 = (torch.randn(4, 256, 128, generator=generator) * 0.1).to(torch.bfloat16)
++                w2 = (torch.randn(4, 128, 128, generator=generator) * 0.1).to(torch.bfloat16)
++                hidden = torch.randn(tokens, 128, generator=generator).to(torch.bfloat16)
++                ids = torch.randint(-1, 4, (tokens, 2), generator=generator, dtype=torch.int32)
++                weights = torch.rand(tokens, 2, generator=generator)
++                actual = engine.fused_experts_bf16_cpu(hidden, w1, w2, weights, ids, 1.0)
++                expected = reference(hidden, w1, w2, weights, ids, 1.0)
++                relative_l2 = (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-9)
++                self.assertLess(float(relative_l2), 0.015)
++                self.assertTrue(bool(torch.isfinite(actual).all()))
++
++    def test_unlimited_entry_and_packed_weights_match_old_entry(self):
++        torch.manual_seed(17)
++        w1 = torch.randn(2, 256, 128).to(torch.bfloat16)
++        w2 = torch.randn(2, 128, 128).to(torch.bfloat16)
++        hidden = torch.randn(32, 128).to(torch.bfloat16)
++        ids = torch.randint(0, 2, (32, 2), dtype=torch.int32)
++        weights = torch.rand(32, 2)
++        old = engine.fused_experts_cpu(hidden, w1, w2, weights, ids, False, False, False, None, None, None, None, None, False)
++        for packed in (False, True):
++            a, b = (engine.convert_weight_packed(w1), engine.convert_weight_packed(w2)) if packed else (w1, w2)
++            actual = engine.fused_experts_bf16_cpu(hidden, a, b, weights, ids, float("inf"), packed)
++            self.assertTrue(torch.equal(actual, old))
++
++    def test_invalid_expert_is_rejected(self):
++        with self.assertRaisesRegex(RuntimeError, "专家编号"):
++            engine.fused_experts_bf16_cpu(
++                torch.ones(1, 128, dtype=torch.bfloat16),
++                torch.ones(2, 256, 128, dtype=torch.bfloat16),
++                torch.ones(2, 128, 128, dtype=torch.bfloat16),
++                torch.ones(1, 1), torch.tensor([[2]], dtype=torch.int32), 10.,
++            )
++
++    def test_shape_mismatch_is_rejected_and_empty_input_is_supported(self):
++        w1 = torch.ones(2, 256, 128, dtype=torch.bfloat16)
++        w2 = torch.ones(2, 128, 128, dtype=torch.bfloat16)
++        with self.assertRaisesRegex(RuntimeError, "路由形状"):
++            engine.fused_experts_bf16_cpu(
++                torch.ones(2, 128, dtype=torch.bfloat16), w1, w2,
++                torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32), 10.,
++            )
++        output = engine.fused_experts_bf16_cpu(
++            torch.empty(0, 128, dtype=torch.bfloat16), w1, w2,
++            torch.empty(0, 1), torch.empty(0, 1, dtype=torch.int32), 10.,
++        )
++        self.assertEqual(tuple(output.shape), (0, 128))
++
++
++if __name__ == "__main__":
++    unittest.main()
