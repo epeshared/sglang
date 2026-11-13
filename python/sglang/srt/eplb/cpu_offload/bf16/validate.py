@@ -24,6 +24,10 @@ def main():
     )
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 8, 32])
     parser.add_argument("--threads", type=int, default=16)
+    parser.add_argument(
+        "--daemon-prefix", help="指定独立守护进程前缀，启用正式 CUDA 通信通道"
+    )
+    parser.add_argument("--daemon-socket", type=int, default=0)
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("此对照需要真实 CUDA GPU")
@@ -39,6 +43,8 @@ def main():
     torch.manual_seed(20261113)
     report = {
         "scope": "真实权重、合成隐状态、固定路由的 MoE 子层对照；不是整层注意力或完整模型生成验收",
+        "backend": "daemon_cuda" if args.daemon_prefix else "in_process",
+        "daemon_prefix": args.daemon_prefix,
         "host": platform.node(),
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(),
@@ -68,7 +74,16 @@ def main():
     }
     destination = Path(args.output)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    handle = 0
+    registered = False
     try:
+        if args.daemon_prefix:
+            handle = moe_cpu_engine.cpu_client_open_slot(
+                args.daemon_prefix, args.daemon_socket, 0, 10000
+            )
+            if not handle:
+                raise RuntimeError("无法连接指定的独立 CPU 守护进程")
+            report["daemon_before"] = dict(moe_cpu_engine.cpu_client_slot_info(handle))
         for layer_id in args.layers:
             print(f"校验并读取层 {layer_id} 的原始 BF16 专家", flush=True)
             weights = load_layer(
@@ -78,7 +93,15 @@ def main():
                 verify=True,
                 verified=report["verified_shards"],
             )
-            cpu = Bf16Experts(weights)
+            if handle:
+                from .daemon import DaemonBf16Experts
+
+                cpu = DaemonBf16Experts(
+                    weights, layer_id, topk, handle, args.daemon_prefix
+                )
+                registered = True
+            else:
+                cpu = Bf16Experts(weights)
             gpu_gate_up, gpu_down = weights.gate_up.cuda(), weights.down.cuda()
             for tokens in args.tokens:
                 for gain in (1.0, 8.0):
@@ -142,6 +165,11 @@ def main():
         report["error"] = f"{type(exc).__name__}: {exc}"
         raise
     finally:
+        if handle:
+            report["daemon_after"] = dict(moe_cpu_engine.cpu_client_slot_info(handle))
+            if registered:
+                moe_cpu_engine.cpu_client_cuda_unregister_slot(handle)
+            moe_cpu_engine.cpu_client_close_slot(handle)
         destination.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     if not report["passed"]:
         raise SystemExit("BF16 数值对照未通过，见报告中的原始读数")
