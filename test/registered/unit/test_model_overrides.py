@@ -362,9 +362,11 @@ class TestBoundaryReductionDefaults(CustomTestCase):
                 )
                 self.assertEqual(
                     resolved.speculative_boundary_reduction,
-                    ("rs+rsv" if same_model else "ar")
-                    if requested == "auto"
-                    else requested,
+                    (
+                        ("rs+rsv" if same_model else "ar")
+                        if requested == "auto"
+                        else requested
+                    ),
                 )
                 self.assertEqual(
                     load.call_count, int(requested == "auto" and not same_model)
@@ -2201,7 +2203,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_deterministic_rocm_rccl_check(self):
         """Deterministic ROCm TP above 2 must not fall back to RCCL; CUDA (which
-        disables the custom all-reduce itself) and TP2 (one summation order) are allowed."""
+        disables the custom all-reduce itself) and TP2 (one summation order) are allowed.
+        """
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _deterministic_rocm_rccl_check
 
@@ -2906,6 +2909,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             _dsa_split_backend_resolution(
                                 _view(arch=arch, learnable_sink=True, **{field: value})
                             )
+                with self.subTest(arch=arch, backends="explicit_triton"):
+                    self.assertEqual(
+                        _dsa_split_backend_resolution(
+                            _view(
+                                arch=arch,
+                                learnable_sink=True,
+                                dsa_prefill_backend="triton",
+                                dsa_decode_backend="triton",
+                            )
+                        ),
+                        {
+                            "dsa_prefill_backend": "triton",
+                            "dsa_decode_backend": "triton",
+                        },
+                    )
             # non-family arch declares nothing
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}

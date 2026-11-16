@@ -31,6 +31,9 @@ from sglang.srt.runtime_context import (
 )
 
 logger = logging.getLogger(__name__)
+from sglang.kernels.ops.attention.dsa.sparse_mla_sinks import (
+    validate_sparse_mla_sink_backend,
+)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged_dsa,
@@ -2400,10 +2403,9 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
-            raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
-            )
+        validate_sparse_mla_sink_backend(
+            attn_sink, dsa_impl, self.attn_dcp_size, self.dsa_shards_index_k
+        )
 
         phase = (
             "decode"
@@ -2602,6 +2604,7 @@ class DeepseekSparseAttnBackend(
                     if self.dsa_index_kpool <= 1
                     else None
                 ),
+                attn_sink=attn_sink,
             ).squeeze(0)
         elif dsa_impl in (
             "flashmla_sparse",
@@ -2800,10 +2803,9 @@ class DeepseekSparseAttnBackend(
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
 
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
-            raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
-            )
+        validate_sparse_mla_sink_backend(
+            attn_sink, dsa_impl, self.attn_dcp_size, self.dsa_shards_index_k
+        )
 
         if dsa_impl == "trtllm":
             return self._forward_trtllm(
@@ -2951,6 +2953,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -3817,6 +3820,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
             triton_sparse_mla_decode_splitk,
@@ -3832,6 +3836,7 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
             workspace=workspace,
+            attn_sink=attn_sink,
         ).squeeze(0)
 
     def _forward_triton_dcp(
