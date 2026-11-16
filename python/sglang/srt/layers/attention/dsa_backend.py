@@ -31,14 +31,14 @@ from sglang.srt.runtime_context import (
 )
 
 logger = logging.getLogger(__name__)
-from sglang.kernels.ops.attention.dsa.sparse_mla_sinks import (
-    validate_sparse_mla_sink_backend,
-)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged_dsa,
     gather_cast_kv_fp8_pad_paged,
     gather_dequant_requant_fp8_paged_dsa,
+)
+from sglang.kernels.ops.attention.dsa.sparse_mla_sinks import (
+    validate_sparse_mla_sink_backend,
 )
 from sglang.kernels.ops.attention.dsa.transform_index import (
     prepare_trtllm_nope_sparse_metadata,
