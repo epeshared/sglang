@@ -7,7 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -222,6 +222,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
+                gpu_experts_mask=(
+                    torch.arange(num_experts, device="cpu") < self.num_gpu_experts
+                ),
                 num_gpu_experts=self.num_gpu_experts,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
@@ -229,6 +232,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+                swiglu_limit=getattr(layer.moe_runner_config, "swiglu_limit", None)
+                or 0.0,
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -267,10 +272,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             moe_runner_config: Configuration for MoE runner
         """
         self.moe_runner_config = moe_runner_config
-        if self.override_num_local_experts:
-            moe_runner_config.num_local_experts = self.num_gpu_experts
-        # Delegate to GPU method to create its runner
-        self.gpu_method.create_moe_runner(layer, moe_runner_config)
+        # DeepseekV2MoE scales the merged CPU/GPU output once. Keep the GPU
+        # runner unscaled without changing the model's shared configuration.
+        gpu_config = replace(
+            moe_runner_config,
+            num_local_experts=(
+                self.num_gpu_experts
+                if self.override_num_local_experts
+                else moe_runner_config.num_local_experts
+            ),
+            routed_scaling_factor=None,
+        )
+        self.gpu_method.create_moe_runner(layer, gpu_config)
 
     def get_moe_runner_backend(self, layer):
         return self.gpu_method.get_moe_runner_backend(layer)
