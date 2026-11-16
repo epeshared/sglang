@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsa.sparse_mla_sinks import (
     apply_sparse_mla_sinks,
+    skip_sparse_mla_sink_schedule,
     validate_sparse_mla_sink_backend,
     validate_sparse_mla_sinks,
 )
@@ -16,6 +17,13 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestSparseMLASinks(unittest.TestCase):
+    def test_sm89_short_context_schedule_guard(self):
+        self.assertTrue(skip_sparse_mla_sink_schedule(True, 2048, 2048, True))
+        self.assertFalse(skip_sparse_mla_sink_schedule(False, 4096, 2048, True))
+        self.assertFalse(skip_sparse_mla_sink_schedule(True, 4096, 2048, False))
+        with self.assertRaisesRegex(NotImplementedError, "context <= index_topk"):
+            skip_sparse_mla_sink_schedule(True, 2049, 2048, True)
+
     def test_closed_form_and_base2_conversion(self):
         out, lse = apply_sparse_mla_sinks(
             torch.tensor([[[4.0]]], dtype=torch.bfloat16),

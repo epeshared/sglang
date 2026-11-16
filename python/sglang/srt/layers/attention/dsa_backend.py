@@ -38,6 +38,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     gather_dequant_requant_fp8_paged_dsa,
 )
 from sglang.kernels.ops.attention.dsa.sparse_mla_sinks import (
+    skip_sparse_mla_sink_schedule,
     validate_sparse_mla_sink_backend,
 )
 from sglang.kernels.ops.attention.dsa.transform_index import (
@@ -834,6 +835,16 @@ class DeepseekSparseAttnBackend(
         else:
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        self.triton_sink_sm89 = (
+            is_cuda()
+            and self.device_capability == (8, 9)
+            and bool(getattr(hf_config, "learnable_sink", False))
+            and self.dsa_decode_impl == "triton"
+            and self.dsa_index_kpool == 1
+            and self.attn_dcp_size == 1
+            and not self.dsa_shards_index_k
+            and not is_dsa_enable_prefill_cp()
+        )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.sparse_prefill_small_heads = _small_heads_prefill_enabled(
             self.device_sm_major,
@@ -1577,10 +1588,20 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        skip_sink_schedule = skip_sparse_mla_sink_schedule(
+            getattr(self, "triton_sink_sm89", False),
+            max_seqlen_k,
+            self.dsa_index_topk,
+            forward_batch.forward_mode.is_decode_or_idle(),
+        )
+        if (
+            is_cuda()
+            and not skip_sink_schedule
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,

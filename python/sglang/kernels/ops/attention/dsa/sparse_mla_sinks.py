@@ -5,6 +5,18 @@ import math
 import torch
 
 
+def skip_sparse_mla_sink_schedule(sm89_compat, max_seq_len, index_topk, is_decode):
+    """Short-context SM89 decode reuses the existing all-keys indexer path."""
+    if not sm89_compat or not is_decode:
+        return False
+    if max_seq_len > index_topk:
+        raise NotImplementedError(
+            "SM89 Triton sink decode currently requires context <= index_topk; "
+            "the DeepGEMM indexer does not support this architecture"
+        )
+    return True
+
+
 def validate_sparse_mla_sink_backend(sinks, backend, dcp_size, shards_index_k):
     if sinks is None:
         return

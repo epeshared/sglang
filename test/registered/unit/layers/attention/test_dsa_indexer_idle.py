@@ -17,6 +17,36 @@ _INDEXER = "sglang.srt.layers.attention.dsa.dsa_indexer"
 
 
 class TestDSAIndexerIdle(unittest.TestCase):
+    def test_sm89_sink_decode_reuses_all_keys_only_for_short_context(self):
+        indexer = SimpleNamespace(index_topk=2048)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_cpu=torch.tensor([2048]),
+        )
+        with (
+            patch(f"{_INDEXER}._is_hip", False),
+            patch(f"{_INDEXER}.dsa_shards_index_k", return_value=False),
+            patch(f"{_INDEXER}.get_is_capture_mode", return_value=False),
+            patch(
+                f"{_INDEXER}.get_attn_backend",
+                return_value=SimpleNamespace(triton_sink_sm89=True),
+            ),
+        ):
+            self.assertTrue(Indexer._should_skip_logits_computation(indexer, batch))
+            batch.seq_lens_cpu = torch.tensor([2049])
+            self.assertFalse(Indexer._should_skip_logits_computation(indexer, batch))
+        batch.seq_lens_cpu = torch.tensor([1])
+        with (
+            patch(f"{_INDEXER}._is_hip", False),
+            patch(f"{_INDEXER}.dsa_shards_index_k", return_value=False),
+            patch(f"{_INDEXER}.get_is_capture_mode", return_value=False),
+            patch(
+                f"{_INDEXER}.get_attn_backend",
+                return_value=SimpleNamespace(triton_sink_sm89=False),
+            ),
+        ):
+            self.assertFalse(Indexer._should_skip_logits_computation(indexer, batch))
+
     def test_builds_invalid_topk_rows_for_padded_idle_tokens(self):
         result = _make_eager_idle_topk_result(
             torch.empty((8, 16)),
