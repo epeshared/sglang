@@ -11,6 +11,41 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+@pytest.mark.parametrize("num_layers", [2, 77])
+def test_expert_location_config_keeps_global_layer_indices(num_layers):
+    config = SimpleNamespace(
+        num_hidden_layers=num_layers,
+        n_routed_experts=256,
+        n_group=1,
+        mlp_layer_types=["dense"] + ["sparse"] * (num_layers - 1),
+    )
+    metadata = hunyuan_v4.HYV4ForCausalLM.get_model_config_for_expert_location(config)
+    assert metadata.num_layers == num_layers
+    assert metadata.num_logical_experts == 256
+    assert metadata.num_groups == 1
+
+
+def test_expert_location_registry_recognizes_hyv4(monkeypatch):
+    from sglang.srt import model_loader
+    from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+    monkeypatch.setattr(
+        model_loader,
+        "get_model_architecture",
+        lambda config: (hunyuan_v4.HYV4ForCausalLM, "HYV4ForCausalLM"),
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(num_hidden_layers=2, n_routed_experts=256, n_group=1)
+    )
+    metadata = ModelConfigForExpertLocation.from_model_config(model_config)
+    assert metadata is not None
+    assert (metadata.num_layers, metadata.num_logical_experts) == (2, 256)
+    monkeypatch.delattr(
+        hunyuan_v4.HYV4ForCausalLM, "get_model_config_for_expert_location"
+    )
+    assert ModelConfigForExpertLocation.from_model_config(model_config) is None
+
+
 def test_attention_gate_uses_attention_tp(monkeypatch):
     attn_tp_size = 2
     parallel = SimpleNamespace(
