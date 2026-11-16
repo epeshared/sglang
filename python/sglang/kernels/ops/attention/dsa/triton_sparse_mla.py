@@ -1282,6 +1282,7 @@ def triton_sparse_mla_fwd(
     d_v: int = 512,
     topk_length: torch.Tensor | None = None,
     max_topk_length: int | None = None,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Unified sparse MLA forward. Auto-selects single-pass vs split-K.
 
@@ -1292,6 +1293,24 @@ def triton_sparse_mla_fwd(
 
     Returns [1, seq, H, d_v] bf16 to match tilelang_sparse_fwd.
     """
+    if attn_sink is not None:
+        # The decode launcher accepts arbitrary query rows. Reuse its existing
+        # LSE-capable fused/split-K kernels for sink prefill as well; causality
+        # and request boundaries are already encoded in the selected indices.
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        return triton_sparse_mla_decode_splitk(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv=kv,
+            indices=indices.unsqueeze(1) if indices.dim() == 2 else indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            lengths=topk_length,
+            attn_sink=attn_sink,
+        )
     seq = q_nope.shape[0]
     H = q_nope.shape[1]
     num_cu = _cu_count(q_nope.device)

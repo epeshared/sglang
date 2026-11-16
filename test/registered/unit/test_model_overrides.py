@@ -2906,6 +2906,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             _dsa_split_backend_resolution(
                                 _view(arch=arch, learnable_sink=True, **{field: value})
                             )
+                with self.subTest(arch=arch, backends="explicit_triton"):
+                    self.assertEqual(
+                        _dsa_split_backend_resolution(
+                            _view(
+                                arch=arch,
+                                learnable_sink=True,
+                                dsa_prefill_backend="triton",
+                                dsa_decode_backend="triton",
+                            )
+                        ),
+                        {
+                            "dsa_prefill_backend": "triton",
+                            "dsa_decode_backend": "triton",
+                        },
+                    )
             # non-family arch declares nothing
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(arch="LlamaForCausalLM")), {}

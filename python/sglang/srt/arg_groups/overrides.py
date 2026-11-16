@@ -654,14 +654,15 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     if getattr(hf_config, "learnable_sink", False):
         backend = "flashmla_sparse"
-        declared = _pin_dsa_backends(
-            view,
-            backend,
-            lambda option, value: (
-                f"{model_arch} uses learnable attention sinks and requires "
-                f"{option} {backend!r}; got {value!r}"
-            ),
-        )
+        for option in ("dsa_prefill_backend", "dsa_decode_backend"):
+            value = getattr(view, option)
+            if value not in (None, backend, "triton"):
+                raise ValueError(
+                    f"{model_arch} uses learnable attention sinks and requires "
+                    f"--{option.replace('_', '-')} 'flashmla_sparse' or 'triton'; "
+                    f"got {value!r}"
+                )
+            declared[option] = value or backend
         logger.warning(
             "Set DSA backends for learnable attention sinks: "
             f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "

@@ -37,6 +37,10 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     gather_cast_kv_fp8_pad_paged,
     gather_dequant_requant_fp8_paged_dsa,
 )
+from sglang.kernels.ops.attention.dsa.sparse_mla_sinks import (
+    skip_sparse_mla_sink_schedule,
+    validate_sparse_mla_sink_backend,
+)
 from sglang.kernels.ops.attention.dsa.transform_index import (
     prepare_trtllm_nope_sparse_metadata,
     transform_index_page_table_decode,
@@ -831,6 +835,16 @@ class DeepseekSparseAttnBackend(
         else:
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        self.triton_sink_sm89 = (
+            is_cuda()
+            and self.device_capability == (8, 9)
+            and bool(getattr(hf_config, "learnable_sink", False))
+            and self.dsa_decode_impl == "triton"
+            and self.dsa_index_kpool == 1
+            and self.attn_dcp_size == 1
+            and not self.dsa_shards_index_k
+            and not is_dsa_enable_prefill_cp()
+        )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.sparse_prefill_small_heads = _small_heads_prefill_enabled(
             self.device_sm_major,
@@ -1574,10 +1588,20 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        skip_sink_schedule = skip_sparse_mla_sink_schedule(
+            getattr(self, "triton_sink_sm89", False),
+            max_seqlen_k,
+            self.dsa_index_topk,
+            forward_batch.forward_mode.is_decode_or_idle(),
+        )
+        if (
+            is_cuda()
+            and not skip_sink_schedule
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -2400,10 +2424,9 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
-            raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
-            )
+        validate_sparse_mla_sink_backend(
+            attn_sink, dsa_impl, self.attn_dcp_size, self.dsa_shards_index_k
+        )
 
         phase = (
             "decode"
@@ -2602,6 +2625,7 @@ class DeepseekSparseAttnBackend(
                     if self.dsa_index_kpool <= 1
                     else None
                 ),
+                attn_sink=attn_sink,
             ).squeeze(0)
         elif dsa_impl in (
             "flashmla_sparse",
@@ -2800,10 +2824,9 @@ class DeepseekSparseAttnBackend(
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, self.dsa_decode_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, "decode")
 
-        if attn_sink is not None and dsa_impl != "flashmla_sparse":
-            raise RuntimeError(
-                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
-            )
+        validate_sparse_mla_sink_backend(
+            attn_sink, dsa_impl, self.attn_dcp_size, self.dsa_shards_index_k
+        )
 
         if dsa_impl == "trtllm":
             return self._forward_trtllm(
@@ -2951,6 +2974,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -3817,6 +3841,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
             triton_sparse_mla_decode_splitk,
@@ -3832,6 +3857,7 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
             workspace=workspace,
+            attn_sink=attn_sink,
         ).squeeze(0)
 
     def _forward_triton_dcp(

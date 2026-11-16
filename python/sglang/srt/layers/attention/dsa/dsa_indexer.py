@@ -976,8 +976,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
                 # No variant means the full indexer path for any context length.
                 return get_capture_attention_variant() == DSA_DENSE
-            # Eager k-only decode skip is validated on ROCm only.
-            if not _is_hip:
+            # SM89 sink compatibility selects every key for short contexts,
+            # so reuse this existing k-only path without DeepGEMM logits.
+            if not _is_hip and not getattr(
+                get_attn_backend(), "triton_sink_sm89", False
+            ):
                 return False
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
                 max_kv_len = int(fb.seq_lens_cpu.max().item())

@@ -10,6 +10,10 @@ on DSA shapes:
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.sparse_mla_sinks import (
+    apply_sparse_mla_sinks,
+    validate_sparse_mla_sinks,
+)
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _FP8_MAX,
     _LOG2E,
@@ -88,6 +92,7 @@ def triton_sparse_mla_decode_splitk(
     workspace: _SplitKWorkspace | None = None,
     return_lse: bool = False,
     lengths: torch.Tensor | None = None,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Split-K Triton sparse MLA decode (DSv4 pattern).
 
@@ -101,7 +106,10 @@ def triton_sparse_mla_decode_splitk(
              Under DCP these are the owned counts and the -1 tail written by
              transform_index_page_table_dcp (transform_index.py).
     returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
+    attn_sink: optional contiguous [H] fp32 natural-log sink logits (BF16 only).
+               Applied once after reduction; returned LSE includes the sink.
     """
+    validate_sparse_mla_sinks(q_nope, q_rope, kv, attn_sink)
     kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
     use_fp8_dot = is_fp8 and not kv_scaled
@@ -178,7 +186,7 @@ def triton_sparse_mla_decode_splitk(
     qk_scale = float(sm_scale) * _LOG2E
     lse = (
         torch.empty(bs, H, device=q_nope.device, dtype=torch.float32)
-        if return_lse
+        if return_lse or attn_sink is not None
         else None
     )
     topk_length = lengths if lengths is not None else idx_flat
@@ -221,10 +229,12 @@ def triton_sparse_mla_decode_splitk(
                     and _page_offsets_fit_i32(kv.shape[0], kv_dim)
                 ),
                 lse_out_ptr=lse,
-                STORE_LSE=return_lse,
+                STORE_LSE=return_lse or attn_sink is not None,
                 num_warps=fused_num_warps,
                 num_stages=2,
             )
+        if attn_sink is not None:
+            out, lse = apply_sparse_mla_sinks(out, lse, attn_sink, idx_flat, lengths)
         return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
     if lengths is None:
@@ -293,9 +303,11 @@ def triton_sparse_mla_decode_splitk(
         D_CHUNK=D_CHUNK,
         BLOCK_K=BLOCK_K,
         lse_out_ptr=lse,
-        STORE_LSE=return_lse,
+        STORE_LSE=return_lse or attn_sink is not None,
         num_warps=4,
     )
+    if attn_sink is not None:
+        out, lse = apply_sparse_mla_sinks(out, lse, attn_sink, idx_flat, lengths)
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
 
