@@ -33,6 +33,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2AttentionMLA,
+    DeepseekV2ForCausalLM,
     DeepseekV2MLP,
     DeepseekV2MoE,
 )
@@ -736,6 +737,11 @@ class HYV4Model(nn.Module):
 
 class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        """Keep global layer IDs, including the dense prefix, for KT loading."""
+        return DeepseekV2ForCausalLM.get_model_config_for_expert_location(config)
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
