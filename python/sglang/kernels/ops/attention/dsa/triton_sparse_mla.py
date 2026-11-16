@@ -1305,7 +1305,7 @@ def triton_sparse_mla_fwd(
             q_nope=q_nope,
             q_rope=q_rope,
             kv=kv,
-            indices=indices,
+            indices=indices.unsqueeze(1) if indices.dim() == 2 else indices,
             sm_scale=sm_scale,
             d_v=d_v,
             lengths=topk_length,

@@ -88,6 +88,24 @@ class TestTritonSparseMLASinks(unittest.TestCase):
         )
         self.assertTrue(torch.equal(actual, base))
 
+    def test_prefill_preserves_two_dimensional_single_key_indices(self):
+        indices = self.indices[:, 0, :1]
+        output = triton_sparse_mla_fwd(
+            self.q[..., :512],
+            self.q[..., 512:],
+            self.kv,
+            indices,
+            0.0625,
+            attn_sink=self.sinks,
+        ).squeeze(0)
+        count = (indices >= 0).sum(-1, keepdim=True).float()
+        factor = torch.exp(
+            torch.log(count) - torch.logaddexp(torch.log(count), self.sinks)
+        )
+        expected = torch.where(count > 0, 4 * factor, 0.0)
+        expected = expected[..., None].expand_as(output).bfloat16()
+        torch.testing.assert_close(output, expected, rtol=0.005, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()
